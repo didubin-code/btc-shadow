@@ -280,12 +280,12 @@ function wsBookTouch(){
   for(const [p,q] of WS.book.yes) if(q>0 && (yb===null||p>yb)) yb=p;
   for(const [p,q] of WS.book.no)  if(q>0 && (nb===null||p>nb)) nb=p;
   if(yb===null&&nb===null)return null;
-  const yesBid = yb!==null? yb/100 : null;
-  const noBid  = nb!==null? nb/100 : null;
+  const yesBid = yb!==null? round(yb/10000,4) : null;
+  const noBid  = nb!==null? round(nb/10000,4) : null;
   return {
     yesBid, noBid,
-    yesAsk: noBid!==null? round(1-noBid,2) : null,
-    noAsk:  yesBid!==null? round(1-yesBid,2) : null,
+    yesAsk: noBid!==null? round(1-noBid,4) : null,
+    noAsk:  yesBid!==null? round(1-yesBid,4) : null,
     yesDepth:[...WS.book.yes.values()].reduce((a,b)=>a+b,0),
     noDepth:[...WS.book.no.values()].reduce((a,b)=>a+b,0),
     source:'websocket'
@@ -294,22 +294,24 @@ function wsBookTouch(){
 function wsApplySnapshot(m){
   // Kalshi wire format (confirmed live): yes_dollars_fp / no_dollars_fp = [[priceStr, qtyStr], ...]
   WS.book.yes.clear(); WS.book.no.clear();
-  const cents=(v)=>Math.round(Number(v)*100);
+  const key=(v)=>Math.round(Number(v)*10000);   // sub-cent precision
   const yes = m.yes_dollars_fp || m.yes_dollars || m.yes || [];
   const no  = m.no_dollars_fp  || m.no_dollars  || m.no  || [];
-  for(const lvl of yes){const p=cents(lvl[0]), q=Number(lvl[1]); if(Number.isFinite(q)&&q>0)WS.book.yes.set(p,q);}
-  for(const lvl of no ){const p=cents(lvl[0]), q=Number(lvl[1]); if(Number.isFinite(q)&&q>0)WS.book.no.set(p,q);}
+  for(const lvl of yes){const p=key(lvl[0]), q=Number(lvl[1]); if(Number.isFinite(q)&&q>0)WS.book.yes.set(p,q);}
+  for(const lvl of no ){const p=key(lvl[0]), q=Number(lvl[1]); if(Number.isFinite(q)&&q>0)WS.book.no.set(p,q);}
   WS.corrupt=false;
 }
 function wsApplyDelta(m){
-  // Kalshi delta: {price_dollars:"0.0700", delta_fp:"-1015.00", side:"no"}
-  const side = (m.side==='no') ? WS.book.no : WS.book.yes;
-  const p = Math.round(Number(m.price_dollars!==undefined?m.price_dollars:m.price)*
-            ((Number(m.price_dollars!==undefined?m.price_dollars:m.price)<=1.0001)?100:1));
+  // price_dollars is a sub-cent dollar string ("0.9010"); key at 1/100-cent precision
+  const raw = (m.price_dollars!==undefined? m.price_dollars : m.price);
+  const rd  = Number(raw);
+  if(!Number.isFinite(rd))return;
+  const p = Math.round((rd<=1.0001? rd : rd/100)*10000);
   const d = Number(m.delta_fp!==undefined?m.delta_fp:(m.delta!==undefined?m.delta:m.quantity_delta));
-  if(!Number.isFinite(p)||!Number.isFinite(d))return;
+  if(!Number.isFinite(d))return;
+  const side = (m.side==='no') ? WS.book.no : WS.book.yes;
   const cur=side.get(p)||0, next=cur+d;
-  if(next<=0) side.delete(p); else side.set(p,next);
+  if(next<=0.0001) side.delete(p); else side.set(p,next);
 }
 function wsSubscribe(ticker){
   if(!WS.sock||WS.sock.readyState!==1||!ticker)return;
@@ -1069,12 +1071,15 @@ function runSelfTest(){
     WS.book.yes.clear(); WS.book.no.clear();
     wsApplySnapshot({yes_dollars_fp:[['0.4700','300.00'],['0.4600','150.00']], no_dollars_fp:[['0.5300','200.00'],['0.5400','100.00']]});
     const t1=wsBookTouch();
-    C.push({name:'v4.0 snapshot -> best yes bid 0.47',pass:t1.yesBid===0.47,got:String(t1.yesBid)});
-    C.push({name:'v4.0 implied yesAsk = 1 - best no bid (0.46)',pass:Math.abs(t1.yesAsk-0.46)<1e-9,got:String(t1.yesAsk)});
+    C.push({name:'v4.0 snapshot -> best yes bid 0.47',pass:Math.abs(t1.yesBid-0.47)<1e-6,got:String(t1.yesBid)});
+    C.push({name:'v4.0 implied yesAsk = 1 - best no bid (0.46)',pass:Math.abs(t1.yesAsk-0.46)<1e-6,got:String(t1.yesAsk)});
     wsApplyDelta({side:'yes',price_dollars:'0.4800',delta_fp:'100.00'});
-    C.push({name:'v4.0 delta adds a new level (yes bid -> 0.48)',pass:wsBookTouch().yesBid===0.48,got:String(wsBookTouch().yesBid)});
+    C.push({name:'v4.0 delta adds a new level (yes bid -> 0.48)',pass:Math.abs(wsBookTouch().yesBid-0.48)<1e-6,got:String(wsBookTouch().yesBid)});
     wsApplyDelta({side:'yes',price_dollars:'0.4800',delta_fp:'-100.00'});
-    C.push({name:'v4.0 delta removes exhausted level (back to 0.47)',pass:wsBookTouch().yesBid===0.47,got:String(wsBookTouch().yesBid)});
+    C.push({name:'v4.0 delta removes exhausted level (back to 0.47)',pass:Math.abs(wsBookTouch().yesBid-0.47)<1e-6,got:String(wsBookTouch().yesBid)});
+    wsApplySnapshot({yes_dollars_fp:[['0.9010','100.00'],['0.9030','200.00']], no_dollars_fp:[['0.0280','50.00']]});
+    C.push({name:'v4.0 sub-cent prices kept distinct (0.9030 top, not merged to 0.90)',pass:Math.abs(wsBookTouch().yesBid-0.9030)<1e-6,got:String(wsBookTouch().yesBid)});
+    C.push({name:'v4.0 sub-cent book has 2 yes levels not 1',pass:WS.book.yes.size===2,got:String(WS.book.yes.size)});
     WS.corrupt=true;
     C.push({name:'v4.0 corrupt book is NOT reported healthy',pass:wsHealthy()===false,got:String(wsHealthy())});
     WS.corrupt=false; WS.book.yes.clear(); WS.book.no.clear();
