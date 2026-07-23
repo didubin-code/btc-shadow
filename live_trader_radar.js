@@ -292,21 +292,22 @@ function wsBookTouch(){
   };
 }
 function wsApplySnapshot(m){
+  // Kalshi wire format (confirmed live): yes_dollars_fp / no_dollars_fp = [[priceStr, qtyStr], ...]
   WS.book.yes.clear(); WS.book.no.clear();
-  const toCents=(v)=>{const n=Number(v);return n<=1.0001?Math.round(n*100):Math.round(n);};
-  const yes = m.yes || m.yes_dollars || [];
-  const no  = m.no  || m.no_dollars  || [];
-  for(const lvl of yes){const p=toCents(lvl[0]),q=Number(lvl[1]); if(q>0)WS.book.yes.set(p,q);}
-  for(const lvl of no ){const p=toCents(lvl[0]),q=Number(lvl[1]); if(q>0)WS.book.no.set(p,q);}
+  const cents=(v)=>Math.round(Number(v)*100);
+  const yes = m.yes_dollars_fp || m.yes_dollars || m.yes || [];
+  const no  = m.no_dollars_fp  || m.no_dollars  || m.no  || [];
+  for(const lvl of yes){const p=cents(lvl[0]), q=Number(lvl[1]); if(Number.isFinite(q)&&q>0)WS.book.yes.set(p,q);}
+  for(const lvl of no ){const p=cents(lvl[0]), q=Number(lvl[1]); if(Number.isFinite(q)&&q>0)WS.book.no.set(p,q);}
   WS.corrupt=false;
 }
 function wsApplyDelta(m){
-  const sideName = m.side || m.book_side || 'yes';
-  const side = sideName==='no' ? WS.book.no : WS.book.yes;
-  const rawP = (m.price!==undefined? m.price : m.price_dollars);
-  const rawD = (m.delta!==undefined? m.delta : m.quantity_delta);
-  const p = Number(rawP)<=1.0001 ? Math.round(Number(rawP)*100) : Math.round(Number(rawP));
-  const d = Number(rawD);
+  // Kalshi delta: {price_dollars:"0.0700", delta_fp:"-1015.00", side:"no"}
+  const side = (m.side==='no') ? WS.book.no : WS.book.yes;
+  const p = Math.round(Number(m.price_dollars!==undefined?m.price_dollars:m.price)*
+            ((Number(m.price_dollars!==undefined?m.price_dollars:m.price)<=1.0001)?100:1));
+  const d = Number(m.delta_fp!==undefined?m.delta_fp:(m.delta!==undefined?m.delta:m.quantity_delta));
+  if(!Number.isFinite(p)||!Number.isFinite(d))return;
   const cur=side.get(p)||0, next=cur+d;
   if(next<=0) side.delete(p); else side.set(p,next);
 }
@@ -1066,13 +1067,13 @@ function runSelfTest(){
   // 24: v4.0 WEBSOCKET BOOK — correctness of the local book reconstruction
   (function(){
     WS.book.yes.clear(); WS.book.no.clear();
-    wsApplySnapshot({yes:[[47,300],[46,150]], no:[[53,200],[54,100]]});
+    wsApplySnapshot({yes_dollars_fp:[['0.4700','300.00'],['0.4600','150.00']], no_dollars_fp:[['0.5300','200.00'],['0.5400','100.00']]});
     const t1=wsBookTouch();
     C.push({name:'v4.0 snapshot -> best yes bid 0.47',pass:t1.yesBid===0.47,got:String(t1.yesBid)});
     C.push({name:'v4.0 implied yesAsk = 1 - best no bid (0.46)',pass:Math.abs(t1.yesAsk-0.46)<1e-9,got:String(t1.yesAsk)});
-    wsApplyDelta({side:'yes',price:48,delta:100});
+    wsApplyDelta({side:'yes',price_dollars:'0.4800',delta_fp:'100.00'});
     C.push({name:'v4.0 delta adds a new level (yes bid -> 0.48)',pass:wsBookTouch().yesBid===0.48,got:String(wsBookTouch().yesBid)});
-    wsApplyDelta({side:'yes',price:48,delta:-100});
+    wsApplyDelta({side:'yes',price_dollars:'0.4800',delta_fp:'-100.00'});
     C.push({name:'v4.0 delta removes exhausted level (back to 0.47)',pass:wsBookTouch().yesBid===0.47,got:String(wsBookTouch().yesBid)});
     WS.corrupt=true;
     C.push({name:'v4.0 corrupt book is NOT reported healthy',pass:wsHealthy()===false,got:String(wsHealthy())});
