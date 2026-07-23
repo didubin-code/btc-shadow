@@ -1,0 +1,8 @@
+{
+  "name": "btc-shadow-trader",
+  "version": "4.0.0",
+  "private": true,
+  "dependencies": {
+    "ws": "^8.18.0"
+  }
+}
