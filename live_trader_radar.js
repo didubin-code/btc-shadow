@@ -272,7 +272,7 @@ try{ WebSocketLib=require('ws'); }catch(_){ /* dependency missing -> WS disabled
 const WS={
   sock:null, ready:false, seq:null, ticker:null, corrupt:false,
   book:{yes:new Map(), no:new Map()},          // price(cents) -> qty
-  lastMsgTs:0, reconnects:0, gaps:0, fills:[], err:null, subId:1
+  lastMsgTs:0, reconnects:0, gaps:0, fills:[], err:null, subId:1, lastSnap:null, lastDelta:null, msgTypes:{}
 };
 function wsBookTouch(){
   // Kalshi single book: yes[] and no[] are BID ladders. Best ask on one side = 1 - best bid on the other.
@@ -293,13 +293,20 @@ function wsBookTouch(){
 }
 function wsApplySnapshot(m){
   WS.book.yes.clear(); WS.book.no.clear();
-  for(const [p,q] of (m.yes||[])) WS.book.yes.set(Number(p),Number(q));
-  for(const [p,q] of (m.no ||[])) WS.book.no.set(Number(p),Number(q));
+  const toCents=(v)=>{const n=Number(v);return n<=1.0001?Math.round(n*100):Math.round(n);};
+  const yes = m.yes || m.yes_dollars || [];
+  const no  = m.no  || m.no_dollars  || [];
+  for(const lvl of yes){const p=toCents(lvl[0]),q=Number(lvl[1]); if(q>0)WS.book.yes.set(p,q);}
+  for(const lvl of no ){const p=toCents(lvl[0]),q=Number(lvl[1]); if(q>0)WS.book.no.set(p,q);}
   WS.corrupt=false;
 }
 function wsApplyDelta(m){
-  const side = m.side==='no' ? WS.book.no : WS.book.yes;
-  const p=Number(m.price), d=Number(m.delta);
+  const sideName = m.side || m.book_side || 'yes';
+  const side = sideName==='no' ? WS.book.no : WS.book.yes;
+  const rawP = (m.price!==undefined? m.price : m.price_dollars);
+  const rawD = (m.delta!==undefined? m.delta : m.quantity_delta);
+  const p = Number(rawP)<=1.0001 ? Math.round(Number(rawP)*100) : Math.round(Number(rawP));
+  const d = Number(rawD);
   const cur=side.get(p)||0, next=cur+d;
   if(next<=0) side.delete(p); else side.set(p,next);
 }
@@ -323,6 +330,9 @@ function wsConnect(){
       WS.lastMsgTs=Date.now();
       let j=null; try{ j=JSON.parse(raw.toString()); }catch(_){ return; }
       const t=j.type;
+      WS.msgTypes[t]=(WS.msgTypes[t]||0)+1;
+      if(t==='orderbook_snapshot')WS.lastSnap=j;
+      if(t==='orderbook_delta'&&!WS.lastDelta)WS.lastDelta=j;
       if(t==='orderbook_snapshot'){ wsApplySnapshot(j.msg||{}); WS.seq=j.seq; }
       else if(t==='orderbook_delta'){
         if(WS.seq!==null && j.seq!==WS.seq+1){        // SEQUENCE GAP -> book untrustworthy
@@ -1146,7 +1156,8 @@ const server=http.createServer(async(req,res)=>{
     if(u.pathname==='/ws')return send(res,200,{enabled:CFG.WS_ENABLED,libLoaded:!!WebSocketLib,
       ready:WS.ready,healthy:wsHealthy(),corrupt:WS.corrupt,ticker:WS.ticker,seq:WS.seq,
       ageMs:WS.lastMsgTs?Date.now()-WS.lastMsgTs:null,reconnects:WS.reconnects,seqGaps:WS.gaps,
-      err:WS.err,touch:wsBookTouch(),recentFills:WS.fills.slice(-5)});
+      err:WS.err,touch:wsBookTouch(),msgTypes:WS.msgTypes,bookLevels:{yes:WS.book.yes.size,no:WS.book.no.size},
+      rawSnapshot:WS.lastSnap,rawDelta:WS.lastDelta,recentFills:WS.fills.slice(-5)});
     if(u.pathname==='/radar')return send(res,200,{url:CFG.RADAR_URL||null,fetches:RADAR.fetches,
       ageSec:RADAR.lastTs?Math.round((Date.now()-RADAR.lastTs)/1000):null,err:RADAR.err,
       parsed:radarSnapshot(),raw:RADAR.last});
