@@ -297,6 +297,11 @@ function wsApplySnapshot(m){
   const key=(v)=>Math.round(Number(v)*10000);   // sub-cent precision
   const yes = m.yes_dollars_fp || m.yes_dollars || m.yes || [];
   const no  = m.no_dollars_fp  || m.no_dollars  || m.no  || [];
+  if(yes.length===0 && no.length===0){        // expired/closed market: empty book
+    WS.corrupt=true; WS.emptySnapshots=(WS.emptySnapshots||0)+1;
+    logLine({ev:'WS_EMPTY_BOOK',ticker:m.market_ticker,note:'market closed or not yet quoting'});
+    return;
+  }
   for(const lvl of yes){const p=key(lvl[0]), q=Number(lvl[1]); if(Number.isFinite(q)&&q>0)WS.book.yes.set(p,q);}
   for(const lvl of no ){const p=key(lvl[0]), q=Number(lvl[1]); if(Number.isFinite(q)&&q>0)WS.book.no.set(p,q);}
   WS.corrupt=false;
@@ -363,7 +368,9 @@ function wsConnect(){
   }catch(e){ WS.err=String(e.message||e); setTimeout(wsConnect,5000); }
 }
 function wsHealthy(){
-  return CFG.WS_ENABLED && WS.ready && !WS.corrupt &&
+  // v4.0.1: empty book (expired/closed market) or stale feed => NOT healthy => REST fallback.
+  const hasBook = WS.book.yes.size>0 && WS.book.no.size>0;
+  return CFG.WS_ENABLED && WS.ready && !WS.corrupt && hasBook &&
          WS.lastMsgTs>0 && (Date.now()-WS.lastMsgTs)<20000;
 }
 
@@ -1080,6 +1087,8 @@ function runSelfTest(){
     wsApplySnapshot({yes_dollars_fp:[['0.9010','100.00'],['0.9030','200.00']], no_dollars_fp:[['0.0280','50.00']]});
     C.push({name:'v4.0 sub-cent prices kept distinct (0.9030 top, not merged to 0.90)',pass:Math.abs(wsBookTouch().yesBid-0.9030)<1e-6,got:String(wsBookTouch().yesBid)});
     C.push({name:'v4.0 sub-cent book has 2 yes levels not 1',pass:WS.book.yes.size===2,got:String(WS.book.yes.size)});
+    WS.book.yes.clear(); WS.book.no.clear();
+    C.push({name:'v4.0.1 empty book is NOT healthy (forces REST fallback)',pass:wsHealthy()===false,got:String(wsHealthy())});
     WS.corrupt=true;
     C.push({name:'v4.0 corrupt book is NOT reported healthy',pass:wsHealthy()===false,got:String(wsHealthy())});
     WS.corrupt=false; WS.book.yes.clear(); WS.book.no.clear();
@@ -1162,7 +1171,7 @@ const server=http.createServer(async(req,res)=>{
     if(u.pathname==='/ws')return send(res,200,{enabled:CFG.WS_ENABLED,libLoaded:!!WebSocketLib,
       ready:WS.ready,healthy:wsHealthy(),corrupt:WS.corrupt,ticker:WS.ticker,seq:WS.seq,
       ageMs:WS.lastMsgTs?Date.now()-WS.lastMsgTs:null,reconnects:WS.reconnects,seqGaps:WS.gaps,
-      err:WS.err,touch:wsBookTouch(),msgTypes:WS.msgTypes,bookLevels:{yes:WS.book.yes.size,no:WS.book.no.size},
+      err:WS.err,touch:wsBookTouch(),emptySnapshots:WS.emptySnapshots||0,msgTypes:WS.msgTypes,bookLevels:{yes:WS.book.yes.size,no:WS.book.no.size},
       rawSnapshot:WS.lastSnap,rawDelta:WS.lastDelta,recentFills:WS.fills.slice(-5)});
     if(u.pathname==='/radar')return send(res,200,{url:CFG.RADAR_URL||null,fetches:RADAR.fetches,
       ageSec:RADAR.lastTs?Math.round((Date.now()-RADAR.lastTs)/1000):null,err:RADAR.err,
