@@ -65,6 +65,7 @@ const CFG = {
   CAL_B: Number(process.env.CAL_B ?? 1.176),              // fit on 190 real settled trades (orig+current), Brier 0.133->0.128
   CAL_ON: !/^(0|false|no)$/i.test(process.env.CAL_ON||''), // on by default
   RADAR_URL: process.env.RADAR_URL||'',        // v3.4: pin-radar status endpoint (observation only)
+   RADAR_MIN_SPOTIMB: Number(process.env.RADAR_MIN_SPOTIMB ?? 0),
   MIN_CUSHION_SIGMA: Number(process.env.MIN_CUSHION_SIGMA || 1.0), // v3.3: price must be this many sigma past strike, DRIFT EXCLUDED
   FAIR_STABLE_N: Number(process.env.FAIR_STABLE_N || 3),           // v3.3: fair must clear the band this many consecutive reads
   TREND_BPS: Number(process.env.TREND_BPS || 0.15),
@@ -738,7 +739,20 @@ function openPos(mkt,side,mode,px,fair,tauSec){
     baseQty=Math.max(1,Math.round(CFG.RISK_DOLLARS/px));
   }
   const qty=STATE.inHV?Math.max(1,Math.floor(baseQty/2)):baseQty;
-  const fees=mode==='taker'?takerFee(px,qty):makerFee(qty);
+  // RADAR GATE: skip entry when spot flow opposes our side. Fail-open on null.
+  {
+    const _snap=radarSnapshot();
+    const _s=_snap.radarSpotImb;
+    if(_s!==null && _s!==undefined){
+      const _signed=(side==='YES')? _s : -_s;
+      if(_signed < CFG.RADAR_MIN_SPOTIMB){
+        logLine({ev:'SKIP',ticker:mkt.ticker,fair:round(fair,3),tauSec,
+          reason:'radar gate: spotImb '+_signed.toFixed(3)+' < '+CFG.RADAR_MIN_SPOTIMB,..._snap});
+        return;
+      }
+    }
+  }
+   const fees=mode==='taker'?takerFee(px,qty):makerFee(qty);
   STATE.pos={ticker:mkt.ticker,strike:mkt.strike,closeTs:mkt.closeTs,side,mode,px,qty,fees,
     entryFair:side==='YES'?fair:1-fair,entryTs:Date.now(),entryTau:tauSec,session:sessionTag(ptClock()),entryDrift:_drift,entryVol:_vol,
     ...radarSnapshot()};
