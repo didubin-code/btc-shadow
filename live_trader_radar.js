@@ -3,7 +3,6 @@
    Makes every decision a live bot would make on Kalshi 15-min BTC markets —
    entries, sizing, exits, settlement — but LOGS trades instead of placing
    them. Purpose: prove positive expectancy before any dollar is at risk.
-
    EDGE STACK (from PANews 1.05M-trade study + our sentinel work):
      E1 late-window convergence: settlement = 60s average → progressively
         locked-in; fair value becomes near-certain while book lags
@@ -15,7 +14,6 @@
         8:45-9:30 ET high-variance sub-window; most windows = no trade
      E5 machine risk control: hard daily stop, fixed size, consecutive-loss
         bench, no averaging down, no hope-holds
-
    Zero dependencies. Deploy as its own Render service:
      Start Command: node shadow_trader.js
    Endpoints: /health /selftest /status /report /log /halt?on=1|0
@@ -25,11 +23,22 @@ const http = require('http');
 const fs = require('fs');
 const { URL } = require('url');
 const crypto = require('crypto');
-
 const PORT = Number(process.env.PORT || 10000);
 const VERSION = 'live-trader-4.0-ws';
 const KALSHI_BASE = (process.env.KALSHI_BASE || 'https://api.elections.kalshi.com/trade-api/v2').replace(/\/+$/,'');
 const LOG_PATH = process.env.LOG_PATH || '/tmp/shadow_trades.jsonl';
+
+/* --------- process-level guards: turn silent crashes into logged, survivable events ---------
+   Without these, an unhandled promise rejection (default since Node 15) or an exception thrown
+   inside an event-emitter callback kills the process — which on Render shows up as the
+   boot -> banner -> die -> restart loop that produces intermittent 502s. Log the real reason
+   (to stderr AND to /log) and stay alive; a bad tick is recoverable, a dead process is not. */
+function fatalLog(ev, e){
+  try{ fs.appendFileSync(LOG_PATH, JSON.stringify({ev, err:String((e&&e.stack)||e), ts:Date.now()})+'\n'); }catch(_){}
+  try{ console.error(ev, e); }catch(_){}
+}
+process.on('uncaughtException', (e)=>fatalLog('FATAL_UNCAUGHT', e));
+process.on('unhandledRejection', (r)=>fatalLog('FATAL_REJECTION', r));
 
 /* ------------------------------ config ------------------------------ */
 const CFG = {
@@ -82,7 +91,6 @@ const CFG = {
   HV_START: process.env.HV_START || '05:45',                     // PT (= 8:45 ET)
   HV_END: process.env.HV_END || '06:30',                         // PT (= 9:30 ET)
 };
-
 /* ----------------------------- helpers ----------------------------- */
 function clamp(x,lo,hi){const n=Number(x);return Number.isFinite(n)?Math.max(lo,Math.min(hi,n)):lo;}
 function round(x,d=4){const n=Number(x);return Number.isFinite(n)?Number(n.toFixed(d)):null;}
@@ -117,12 +125,9 @@ function sessionTag(nowMin){ // PT buckets for per-session P&L breakdown
   if(nowMin<hm('13:00'))return'midday';
   return'evening';
 }
-
-
 /* --------------------- fees (Kalshi model) --------------------- */
 function takerFee(price,qty){return CFG.TAKER_FEE_K*price*(1-price)*qty;}
 function makerFee(qty){return CFG.MAKER_FEE*qty;}
-
 /* --------------- BRTI proxy tape (Coinbase/Kraken/Bitstamp) --------------- */
 const TAPE=[]; // [ts, price] rolling ~20 min
 let lastTapeErr=null;
@@ -170,7 +175,6 @@ function tapeAvg(fromTs,toTs){ // time-weighted avg over [fromTs,toTs]
   for(let i=1;i<w.length;i++){const dt=(w[i][0]-w[i-1][0])/1000;sum+=w[i-1][1]*dt;dur+=dt;}
   return dur>0?sum/dur:null;
 }
-
 /* --------------- upstream sentinel (Binance perp, compact) --------------- */
 function ewmaZ(a){let m=null,v=null;return{update(x){if(m===null){m=x;v=1e-9;return 0;}const d=x-m;m+=a*d;v=(1-a)*(v+a*d*d);return d/Math.sqrt(Math.max(v,1e-9));}};}
 const z2s=z=>clamp(z/3.5,-1,1)*100;
@@ -254,12 +258,9 @@ async function sentPoll(){
     }
     if(any)SENT.lastOk=now;
   }catch(_){}
-  SENT.read=sentCompute();
-  if(SENT.read)SENT.read.venue=SENT.venue||null;
+  try{ SENT.read=sentCompute(); if(SENT.read)SENT.read.venue=SENT.venue||null; }catch(_){}
 }
-function ensureSentinel(){if(SENT.started)return;SENT.started=true;sentPoll();const t=setInterval(sentPoll,2500);if(t.unref)t.unref();}
-
-
+function ensureSentinel(){if(SENT.started)return;SENT.started=true;sentPoll().catch(()=>{});const t=setInterval(()=>{sentPoll().catch(()=>{});},2500);if(t.unref)t.unref();}
 /* ==================== v4.0 WEBSOCKET BOOK FEED ====================
    Replaces the 2s REST poll for order-book data with a live stream.
    - auth: RSA-PSS over `{ts}GET/trade-api/ws/v2` on the upgrade handshake
@@ -269,7 +270,6 @@ function ensureSentinel(){if(SENT.started)return;SENT.started=true;sentPoll();co
 =================================================================== */
 let WebSocketLib=null;
 try{ WebSocketLib=require('ws'); }catch(_){ /* dependency missing -> WS disabled, REST fallback */ }
-
 const WS={
   sock:null, ready:false, seq:null, ticker:null, corrupt:false,
   book:{yes:new Map(), no:new Map()},          // price(cents) -> qty
@@ -335,7 +335,7 @@ function wsConnect(){
     const s=new WebSocketLib(CFG.WS_URL,{headers});
     WS.sock=s;
     s.on('open',()=>{WS.ready=true;WS.err=null;logLine({ev:'WS_OPEN',url:CFG.WS_URL});if(WS.ticker)wsSubscribe(WS.ticker);});
-    s.on('message',(raw)=>{
+    s.on('message',(raw)=>{ try{
       WS.lastMsgTs=Date.now();
       let j=null; try{ j=JSON.parse(raw.toString()); }catch(_){ return; }
       const t=j.type;
@@ -358,7 +358,7 @@ function wsConnect(){
         if(WS.fills.length>100)WS.fills.shift();
         logLine({ev:'WS_FILL',ticker:m.market_ticker,count:m.count,price:m.price,side:m.side});
       }
-    });
+    }catch(err){ WS.err='msg handler: '+String((err&&err.message)||err); logLine({ev:'WS_MSG_ERROR',err:WS.err}); } });
     s.on('ping',()=>{ try{s.pong();}catch(_){} });
     s.on('error',(e)=>{WS.err=String(e.message||e);logLine({ev:'WS_ERROR',err:WS.err});});
     s.on('close',()=>{
@@ -374,7 +374,6 @@ function wsHealthy(){
   return CFG.WS_ENABLED && WS.ready && !WS.corrupt && hasBook &&
          WS.lastMsgTs>0 && (Date.now()-WS.lastMsgTs)<20000;
 }
-
 /* --------------------- PIN RADAR OBSERVER (v3.4) ---------------------
    Fetches the radar's independent signals (spot CVD, Kalshi book imbalance)
    and stamps them on every OPEN. OBSERVATION ONLY — no decision uses these.
@@ -487,7 +486,6 @@ async function fetchLivePositions(){
   try{ return await kalshiAuthed('GET','/portfolio/positions'); }
   catch(e){ LIVE.lastErr=String(e.message||e); return null; }
 }
-
 /* --------------------- Kalshi market discovery --------------------- */
 let mktCache={t:0,data:null};
 const DISC={ts:0,err:null,totalMarkets:0,btcCount:0,nearestCloseSec:null,picked:null};
@@ -568,7 +566,6 @@ async function getBook(ticker,fallbackQuotes){
   }else if(empty){data.source='none';}
   obCache={t:now,ticker,data};return data;
 }
-
 /* --------------------- fair value engine (E1 core) --------------------- */
 /* P(settlement avg over final 60s > strike).
    tau > 60: terminal distn of the average; effective horizon = (tau-60)+20s
@@ -596,7 +593,6 @@ function computeFair(o){
   sd=Math.max(1e-6,sigUsdPerSqrtSec*Math.sqrt(r/3));
   return clamp(1-normCdf((reqFutureMean-mean)/sd),0.001,0.999);
 }
-
 /* --------------------- decision engine (E2-E4) --------------------- */
 function decideEntry(o){
   const {fair,book,tauSec,inHV,sentPressure,haveOpen,ticker,lockout}=o;
@@ -713,7 +709,6 @@ function decideExit(o){ // firm stay-in: exit ONLY on a PERSISTENT confirmed rev
     return{exit:true,cond:true,reason:'confirmed reversal ('+Math.round(heldMs/1000)+'s persist): perp '+sentPressure+', fair '+round(pos.entryFair,2)+'→'+round(posFair,2)};
   return{exit:false,cond:true};                                  // armed, waiting for persistence
 }
-
 /* --------------------- risk cage (E5) --------------------- */
 function makeCage(){
   return{
@@ -728,10 +723,20 @@ function makeCage(){
   };
 }
 const cage=makeCage();
-
 /* --------------------- shadow book-keeping --------------------- */
 const STATE={pos:null,pendingMaker:null,lastReversal:null,cooldownUntil:0,fairStreak:0,fairStreakTicker:'',trades:[],reconcile:[],lastStatus:null,lastErr:null,ticks:0,lastSkipKey:'',skips:[],phantoms:[],revCondSince:0};
-function logLine(obj){try{fs.appendFileSync(LOG_PATH,JSON.stringify(obj)+'\n');}catch(_){}}
+let _logWrites=0;
+function logLine(obj){
+  try{
+    // periodic size guard: /tmp is small and this file is append-only; cap it so a long-lived
+    // instance can't fill the disk. /report reads STATE (in-memory), not this file, so truncation
+    // only drops the raw /log tail, never P&L.
+    if((++_logWrites % 500)===0){
+      try{ const st=fs.statSync(LOG_PATH); if(st.size>25*1024*1024) fs.truncateSync(LOG_PATH,0); }catch(_){}
+    }
+    fs.appendFileSync(LOG_PATH,JSON.stringify(obj)+'\n');
+  }catch(_){}
+}
 function openPos(mkt,side,mode,px,fair,tauSec){
   const _drift=round(tapeDrift(),4), _vol=round(tapeVolBps(),3);
   let baseQty=CFG.CONTRACTS;
@@ -783,7 +788,6 @@ function closePos(reason,exitPx,settled,won,extra){
     if(STATE.phantoms.length>50)STATE.phantoms.shift();}
   STATE.pos=null; STATE.revCondSince=0;
 }
-
 /* --------------------- main loop --------------------- */
 async function tick(){
   STATE.ticks++;
@@ -935,12 +939,10 @@ async function tick(){
     pendingMaker:STATE.pendingMaker?{px:STATE.pendingMaker.px}:null,
     tapeErr:lastTapeErr,err:STATE.lastErr};
 }
-
 function truthPnl(rec,actualWin){ // recompute a settled trade's P&L from Kalshi's official result
   const fee=rec.mode==='taker'?takerFee(rec.entryPx,rec.qty):CFG.MAKER_FEE*rec.qty;
   return Math.round((rec.qty*((actualWin?1:0)-rec.entryPx)-fee)*100)/100;
 }
-
 /* --------------------- reporting --------------------- */
 function report(){
   const t=STATE.trades;
@@ -958,7 +960,6 @@ function report(){
     byMode,bySession,todayRealized:round(cage.realized,2),consecLosses:cage.consecLosses,halt:cage.halted(),
     last10:t.slice(-10)};
 }
-
 /* --------------------- self-test (pure, offline) --------------------- */
 function runSelfTest(){
   const C=[];
@@ -1170,7 +1171,6 @@ function runSelfTest(){
   const failed=C.filter(c=>!c.pass);
   return{ok:failed.length===0,version:VERSION,passed:C.length-failed.length,total:C.length,checks:C};
 }
-
 /* --------------------- HTTP --------------------- */
 const server=http.createServer(async(req,res)=>{
   const u=new URL(req.url,`http://${req.headers.host}`);
