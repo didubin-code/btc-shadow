@@ -24,7 +24,7 @@ const fs = require('fs');
 const { URL } = require('url');
 const crypto = require('crypto');
 const PORT = Number(process.env.PORT || 10000);
-const VERSION = 'live-trader-4.3-truesigma';
+const VERSION = 'live-trader-4.4-kalshisettle';
 const KALSHI_BASE = (process.env.KALSHI_BASE || 'https://api.elections.kalshi.com/trade-api/v2').replace(/\/+$/,'');
 const LOG_PATH = process.env.LOG_PATH || '/tmp/shadow_trades.jsonl';
 
@@ -89,6 +89,9 @@ const CFG = {
   COOLDOWN_SIGMA: Number(process.env.COOLDOWN_SIGMA || 2.0), // "violent" = fair moved > this many sigma vs entry, or a reversal fired
   RISK_DOLLARS: Number(process.env.RISK_DOLLARS || 0),    // v2.3 LADDER: 0=flat shadow. Live: start 25, then 50/100/200/400 every ~50 trades while watching return-on-risk.
   SETTLE_METRIC: (process.env.SETTLE_METRIC || 'last'),   // 'last' (point-in-time, Kalshi-confirmed) or 'avg60' (legacy)
+  KALSHI_SETTLE: !/^(0|false|no)$/i.test(process.env.KALSHI_SETTLE||''),   // v4.4: near the strike the proxy tape and Kalshi's official BRTI disagree (source of every CORRECTION). When |margin| < KALSHI_SETTLE_BAND, DON'T guess with the tape — wait for Kalshi's official result and settle on that. Away from the strike the tape is reliable, settle immediately. On by default.
+  KALSHI_SETTLE_BAND: Number(process.env.KALSHI_SETTLE_BAND || 15),   // $ from strike within which we defer to Kalshi truth instead of the proxy tape
+  KALSHI_SETTLE_WAIT: Number(process.env.KALSHI_SETTLE_WAIT || 90),   // max seconds to wait for Kalshi's result before falling back to the tape (never strand a position)
   PRIME_START: process.env.PRIME_START || '05:30',               // PT
   PRIME_END: process.env.PRIME_END || '09:00',                   // PT
   HV_START: process.env.HV_START || '05:45',                     // PT (= 8:45 ET)
@@ -828,10 +831,32 @@ async function tick(){
       const avg=tapeAvg(STATE.pos.closeTs-60000,STATE.pos.closeTs);
       const lastPx=tapeLastAt(STATE.pos.closeTs);
       const metric=(CFG.SETTLE_METRIC==='avg60')?avg:lastPx;   // v2.0: point-in-time by default (Kalshi-confirmed)
-      const won=metric!==null?(STATE.pos.side==='YES'?metric>STATE.pos.strike:metric<=STATE.pos.strike):null;
-      closePos('settlement ('+CFG.SETTLE_METRIC+' '+round(metric,2)+')',null,true,!!won,
-        {settleAvg60:round(avg,2),settleLast:round(lastPx,2),settleUsed:CFG.SETTLE_METRIC,
-         margin:metric!==null?round(metric-STATE.pos.strike,2):null,strike:STATE.pos.strike});
+      const proxyMargin=metric!==null?(metric-STATE.pos.strike):null;
+      // v4.4 KALSHI-TRUTH SETTLEMENT: near the strike the proxy is unreliable (source of every CORRECTION).
+      // Instead of booking a tape-guess and correcting 30s later, fetch Kalshi's official result and settle on it.
+      const nearStrike = proxyMargin!==null && Math.abs(proxyMargin)<CFG.KALSHI_SETTLE_BAND;
+      const waitedMs = Date.now()-STATE.pos.closeTs;
+      if(CFG.KALSHI_SETTLE && nearStrike && waitedMs<CFG.KALSHI_SETTLE_WAIT*1000 && !STATE.pos._kalshiPending){
+        // ask Kalshi once; settle when it answers. Do NOT book a proxy guess in the meantime.
+        STATE.pos._kalshiPending=true;
+        const posRef=STATE.pos;
+        fetchJson(KALSHI_BASE+'/markets/'+encodeURIComponent(posRef.ticker)).then(j=>{
+          const result=j&&j.market&&j.market.result;
+          if((result==='yes'||result==='no') && STATE.pos===posRef){
+            const won=posRef.side==='YES'?result==='yes':result==='no';
+            closePos('settlement (kalshi '+result+', near-strike '+round(proxyMargin,2)+')',null,true,won,
+              {settleAvg60:round(avg,2),settleLast:round(lastPx,2),settleUsed:'kalshi',kalshiResult:result,
+               margin:round(proxyMargin,2),strike:posRef.strike});
+          } else if(STATE.pos===posRef){ posRef._kalshiPending=false; } // not resolved yet; retry next tick
+        }).catch(()=>{ if(STATE.pos===posRef)posRef._kalshiPending=false; });
+      } else if(!STATE.pos._kalshiPending){
+        // clear of the strike (proxy reliable) OR Kalshi wait exceeded -> settle on the tape as before
+        const won=metric!==null?(STATE.pos.side==='YES'?metric>STATE.pos.strike:metric<=STATE.pos.strike):null;
+        const lbl=(CFG.KALSHI_SETTLE&&nearStrike)?'tape-fallback (kalshi timeout)':CFG.SETTLE_METRIC;
+        closePos('settlement ('+lbl+' '+round(metric,2)+')',null,true,!!won,
+          {settleAvg60:round(avg,2),settleLast:round(lastPx,2),settleUsed:lbl,
+           margin:proxyMargin!==null?round(proxyMargin,2):null,strike:STATE.pos.strike});
+      }
     }
     if(STATE.lastReversal&&mkt&&STATE.lastReversal.ticker!==mkt.ticker)STATE.lastReversal=null;
     // cancel a resting shadow bid the moment its window rolls over
@@ -1185,6 +1210,14 @@ function runSelfTest(){
   // 18: Kalshi-truth correction — tonight's mismatch (NO @0.79 scored win, actually lost)
   const tp=truthPnl({mode:'taker',entryPx:0.79,qty:10},false);
   C.push({name:'truthPnl flips phantom win to real loss',pass:Math.abs(tp-(-8.02))<0.02,got:tp});
+  // v4.4 KALSHI-TRUTH SETTLEMENT — near-strike detection + config sanity
+  C.push({name:'v4.4 KALSHI_SETTLE on by default',pass:CFG.KALSHI_SETTLE===true,got:String(CFG.KALSHI_SETTLE)});
+  C.push({name:'v4.4 settle band is a sane dollar distance',pass:CFG.KALSHI_SETTLE_BAND>0&&CFG.KALSHI_SETTLE_BAND<=50,got:'$'+CFG.KALSHI_SETTLE_BAND});
+  C.push({name:'v4.4 wait cap never strands a position (bounded seconds)',pass:CFG.KALSHI_SETTLE_WAIT>0&&CFG.KALSHI_SETTLE_WAIT<=300,got:CFG.KALSHI_SETTLE_WAIT+'s'});
+  // the -5.67 margin trade (2215, the CORRECTION) is inside the band -> would defer to Kalshi, not book a proxy guess
+  (function(){const m=-5.67;C.push({name:'v4.4 the -$5.67 correction trade IS near-strike (would defer to Kalshi)',pass:Math.abs(m)<CFG.KALSHI_SETTLE_BAND,got:'|'+m+'| < '+CFG.KALSHI_SETTLE_BAND});})();
+  // a clear trade (margin -65) is OUTSIDE the band -> settles immediately on tape (no latency added)
+  (function(){const m=-65.76;C.push({name:'v4.4 clear-of-strike trade settles immediately (no Kalshi wait)',pass:Math.abs(m)>=CFG.KALSHI_SETTLE_BAND,got:'|'+m+'| >= '+CFG.KALSHI_SETTLE_BAND});})();
   const failed=C.filter(c=>!c.pass);
   return{ok:failed.length===0,version:VERSION,passed:C.length-failed.length,total:C.length,checks:C};
 }
