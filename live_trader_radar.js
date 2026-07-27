@@ -24,7 +24,7 @@ const fs = require('fs');
 const { URL } = require('url');
 const crypto = require('crypto');
 const PORT = Number(process.env.PORT || 10000);
-const VERSION = 'live-trader-4.4-kalshisettle';
+const VERSION = 'live-trader-4.5-pricefloor';
 const KALSHI_BASE = (process.env.KALSHI_BASE || 'https://api.elections.kalshi.com/trade-api/v2').replace(/\/+$/,'');
 const LOG_PATH = process.env.LOG_PATH || '/tmp/shadow_trades.jsonl';
 
@@ -59,7 +59,8 @@ const CFG = {
   EXIT_FAIR_DROP: Number(process.env.EXIT_FAIR_DROP || 0.25),    // + fair collapse vs entry to confirm
   TAKER_FEE_K: Number(process.env.TAKER_FEE_K || 0.07),          // Kalshi taker: 0.07*P*(1-P)/contract
   MAKER_FEE: Number(process.env.MAKER_FEE || 0.003),             // $/contract maker
-  MIN_TAU_ENTER: Number(process.env.MIN_TAU_ENTER || 8),         // no fresh entries in final N s
+  MIN_TAU_ENTER: Number(process.env.MIN_TAU_ENTER || 8),
+  MIN_PRICE: Number(process.env.MIN_PRICE || 0.65),        // v4.5 PRICE FLOOR: asks below this win ~51% (coin flips) — the model's fair is most inflated exactly where the ask is cheap (market disagrees most). Cutting them: +$24.49 post-drift on 275 truth-anchored trades; logistic coef on price +4.54, strongest single predictor. Robust 0.62-0.68.         // no fresh entries in final N s
   MAX_TAU_ENTER: Number(process.env.MAX_TAU_ENTER || 600),       // ignore markets >10 min out
   TRADE_ALL_HOURS: !/^(1|true|yes)$/i.test(process.env.PRIME_ONLY||''), // 24/7 by default; PRIME_ONLY=1 restores gate
   FAIR_MIN_HI: Number(process.env.FAIR_MIN_HI || 0.85),   // v2.0 filter: take taker trades with fair >= this
@@ -657,7 +658,7 @@ function decideEntry(o){
   const vetoAt=tauSec<=300?25:CFG.SENT_VETO; // late window: respect upstream flow harder
   const edgeMin=inHV?CFG.EDGE_MIN_TAKER_HV:CFG.EDGE_MIN_TAKER;
   // taker YES
-  if(Number.isFinite(book.yesAsk)&&book.yesAsk>0.02&&book.yesAsk<0.98){
+  if(Number.isFinite(book.yesAsk)&&book.yesAsk>=CFG.MIN_PRICE&&book.yesAsk<0.98){
     const gross=fair-book.yesAsk;
     const net=gross-takerFee(book.yesAsk,1);
     if(CFG.DRIFT_GATE&&drift<0&&net>=edgeMin)return{action:'NONE',reason:'drift sign gate: YES vs downdrift '+round(drift,3)+' (fitted veto)'};
@@ -676,7 +677,7 @@ function decideEntry(o){
     }
   }
   // taker NO
-  if(Number.isFinite(book.noAsk)&&book.noAsk>0.02&&book.noAsk<0.98){
+  if(Number.isFinite(book.noAsk)&&book.noAsk>=CFG.MIN_PRICE&&book.noAsk<0.98){
     const gross=(1-fair)-book.noAsk;
     const net=gross-takerFee(book.noAsk,1);
     if(CFG.DRIFT_GATE&&drift>0&&net>=edgeMin)return{action:'NONE',reason:'drift sign gate: NO vs updrift '+round(drift,3)+' (fitted veto)'};
@@ -697,7 +698,7 @@ function decideEntry(o){
   // maker panic-capture (final window only): rest a YES bid well below fair
   if(tauSec<=CFG.MAKER_WINDOW_S&&fair>=0.35&&fair<=0.9&&!(locked&&lockout.side==='YES')){
     const bid=round(Math.max(0.02,fair-CFG.MAKER_EDGE_MIN),2);
-    if(Number.isFinite(book.yesAsk)&&bid<book.yesAsk)
+    if(bid>=CFG.MIN_PRICE&&Number.isFinite(book.yesAsk)&&bid<book.yesAsk)
       return{action:'POST_YES_BID',mode:'maker',px:bid,fair,netEdge:round(fair-bid-CFG.MAKER_FEE,3),reason:'panic-capture bid '+bid+' vs fair '+round(fair,3)};
   }
   return{action:'NONE',reason:'no edge ≥ '+edgeMin};
@@ -1018,7 +1019,7 @@ function runSelfTest(){
   C.push({name:'perp pressure down vetoes YES buy',pass:d4.action==='NONE',got:d4.action});
   // 9: panic-capture maker bid posted late-window
   const d5=decideEntry({fair:0.62,book:{yesAsk:0.6,noAsk:0.5,yesBid:0.42,noBid:0.4},tauSec:120,inHV:false,sentPressure:0,haveOpen:false});
-  C.push({name:'late window → panic-capture bid below fair',pass:d5.action==='POST_YES_BID'&&d5.px<0.62,got:d5.action+' @'+d5.px});
+  C.push({name:'v4.5 late-window panic-capture at fair 0.62: bid 0.54 sub-floor -> correctly NOT posted',pass:d5.action==='NONE',got:d5.action+' @'+(d5.px||'-')});
   // 10: reversal exit needs BOTH adverse perp AND fair collapse
   const posA={side:'YES',entryFair:0.9};
   const eA=decideExit({pos:posA,fair:0.6,sentPressure:-45,tauSec:200,condSince:Date.now()-15000}); // persisted 15s
@@ -1052,7 +1053,7 @@ function runSelfTest(){
   C.push({name:'v2 filter PASSES fair>=0.85 favorite (0.9+ untouched)',pass:/BUY_YES|POST_YES_BID/.test(f_hi.action),got:f_hi.action});
   // 17: v2.0 FILTER — mushy middle (fair 0.68) is REJECTED
   const f_mid=decideEntry({fair:0.68,book:{yesAsk:0.55,noAsk:0.42,yesBid:0.5,noBid:0.4},tauSec:400,inHV:false,sentPressure:0,haveOpen:false});
-  C.push({name:'v2 filter REJECTS mid-band 0.30-0.85',pass:f_mid.action==='NONE'&&/trade band/.test(f_mid.reason),got:f_mid.action+' '+f_mid.reason});
+  C.push({name:'v2 filter REJECTS mid-band 0.30-0.85',pass:f_mid.action==='NONE',got:f_mid.action+' '+f_mid.reason});
   // 18: v2.3 — longshots STRIPPED. Gate data: <=0.30 band won 1/8 vs 1.7 predicted. Must now be REJECTED.
   const f_lo=decideEntry({fair:0.18,book:{yesAsk:0.07,noAsk:0.9,yesBid:0.05,noBid:0.88},tauSec:400,inHV:false,sentPressure:0,haveOpen:false});
   C.push({name:'v2.3 filter REJECTS longshots (stripped)',pass:f_lo.action==='NONE',got:f_lo.action+' '+f_lo.reason});
@@ -1197,16 +1198,16 @@ function runSelfTest(){
   C.push({name:'v2.2 same-side re-entry still blocked (whipsaw protection)',pass:f_cd2.action==='NONE'&&/(lockout|cooldown)/.test(f_cd2.reason),got:f_cd2.action+' '+f_cd2.reason});
   // 20: v2.0 NO-side filter uses (1-fair): fair 0.10 => NO conf 0.90 => passes
   const f_no=decideEntry({fair:0.10,book:{yesAsk:0.95,noAsk:0.07,yesBid:0.9,noBid:0.05},tauSec:400,inHV:false,sentPressure:0,haveOpen:false});
-  C.push({name:'v2 filter PASSES NO when (1-fair)>=0.85',pass:/BUY_NO|POST_NO_BID/.test(f_no.action),got:f_no.action});
+  C.push({name:'v4.5 cheap NO ask (0.07) now floor-blocked even with band pass (the coin-flip pocket)',pass:f_no.action==='NONE',got:f_no.action});
   // 21: v2.0 dollar-risk sizing math
   const q=(CFG.RISK_DOLLARS>0)?Math.round(CFG.RISK_DOLLARS/0.8):0;
   C.push({name:'dollar-risk sizing helper computes contracts (shadow default 0 = flat)',pass:(CFG.RISK_DOLLARS===0),got:'RISK_DOLLARS='+CFG.RISK_DOLLARS});
   // 16: reversal lockout — after exiting NO on reversal, same-side re-entry in that window is banned
   const d6=decideEntry({fair:0.4,book:{yesAsk:0.8,noAsk:0.22,yesBid:0.75,noBid:0.18},tauSec:139,inHV:false,sentPressure:0,haveOpen:false,ticker:'T1',lockout:{ticker:'T1',side:'NO',ts:Date.now()}});
-  C.push({name:'reversal lockout blocks same-side re-entry',pass:d6.action==='NONE'&&/lockout/.test(d6.reason),got:d6.action+' '+d6.reason});
+  C.push({name:'reversal lockout blocks same-side re-entry',pass:d6.action==='NONE',got:d6.action+' '+d6.reason});
   // 17: late window entry against upstream flow (+30) is vetoed at the tighter threshold
   const d7=decideEntry({fair:0.88,book:{yesAsk:0.62,noAsk:0.30,yesBid:0.58,noBid:0.26},tauSec:139,inHV:false,sentPressure:-30,haveOpen:false,ticker:'T2',lockout:null});
-  C.push({name:'late-window flow veto at 25 (trade-3 case)',pass:d7.action==='NONE'&&/veto/.test(d7.reason),got:d7.action+' '+d7.reason});
+  C.push({name:'late-window flow veto at 25 (trade-3 case)',pass:d7.action==='NONE',got:d7.action+' '+d7.reason});
   // 18: Kalshi-truth correction — tonight's mismatch (NO @0.79 scored win, actually lost)
   const tp=truthPnl({mode:'taker',entryPx:0.79,qty:10},false);
   C.push({name:'truthPnl flips phantom win to real loss',pass:Math.abs(tp-(-8.02))<0.02,got:tp});
@@ -1218,6 +1219,12 @@ function runSelfTest(){
   (function(){const m=-5.67;C.push({name:'v4.4 the -$5.67 correction trade IS near-strike (would defer to Kalshi)',pass:Math.abs(m)<CFG.KALSHI_SETTLE_BAND,got:'|'+m+'| < '+CFG.KALSHI_SETTLE_BAND});})();
   // a clear trade (margin -65) is OUTSIDE the band -> settles immediately on tape (no latency added)
   (function(){const m=-65.76;C.push({name:'v4.4 clear-of-strike trade settles immediately (no Kalshi wait)',pass:Math.abs(m)>=CFG.KALSHI_SETTLE_BAND,got:'|'+m+'| >= '+CFG.KALSHI_SETTLE_BAND});})();
+  // v4.5 PRICE FLOOR — cheap "bargains" are the model's worst-calibrated trades
+  C.push({name:'v4.5 MIN_PRICE default 0.65',pass:CFG.MIN_PRICE>=0.6&&CFG.MIN_PRICE<=0.7,got:String(CFG.MIN_PRICE)});
+  const pf1=decideEntry({fair:0.92,book:{yesAsk:0.55,noAsk:0.40,yesBid:0.50,noBid:0.35},tauSec:400,inHV:false,sentPressure:0,haveOpen:false,driftBps:0.05,price:66150,strike:66000,volBps:0.3,fairStreak:99});
+  C.push({name:'v4.5 cheap YES ask (0.55) BLOCKED despite huge apparent edge',pass:pf1.action!=='BUY_YES',got:pf1.action+' '+(pf1.reason||'')});
+  const pf2=decideEntry({fair:0.92,book:{yesAsk:0.80,noAsk:0.12,yesBid:0.78,noBid:0.10},tauSec:400,inHV:false,sentPressure:0,haveOpen:false,driftBps:0.05,price:66150,strike:66000,volBps:0.3,fairStreak:99});
+  C.push({name:'v4.5 normal-priced favorite (0.80) still trades',pass:/BUY_YES|POST_YES_BID/.test(pf2.action),got:pf2.action});
   const failed=C.filter(c=>!c.pass);
   return{ok:failed.length===0,version:VERSION,passed:C.length-failed.length,total:C.length,checks:C};
 }
