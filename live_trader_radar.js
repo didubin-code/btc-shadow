@@ -24,7 +24,7 @@ const fs = require('fs');
 const { URL } = require('url');
 const crypto = require('crypto');
 const PORT = Number(process.env.PORT || 10000);
-const VERSION = 'live-trader-4.0-ws';
+const VERSION = 'live-trader-4.1-driftgate';
 const KALSHI_BASE = (process.env.KALSHI_BASE || 'https://api.elections.kalshi.com/trade-api/v2').replace(/\/+$/,'');
 const LOG_PATH = process.env.LOG_PATH || '/tmp/shadow_trades.jsonl';
 
@@ -78,6 +78,7 @@ const CFG = {
   MIN_CUSHION_SIGMA: Number(process.env.MIN_CUSHION_SIGMA || 1.0), // v3.3: price must be this many sigma past strike, DRIFT EXCLUDED
   FAIR_STABLE_N: Number(process.env.FAIR_STABLE_N || 3),           // v3.3: fair must clear the band this many consecutive reads
   TREND_BPS: Number(process.env.TREND_BPS || 0.15),
+  DRIFT_GATE: !/^(0|false|no)$/i.test(process.env.DRIFT_GATE||''), // v4.1: hard sign-alignment veto (fitted 7/23-7/26, 282 truth-anchored trades): NO blocked when drift>0, YES blocked when drift<0. Counterfactual: +$19.40 over 4 days, $/trade 0.205->0.329 on settled. Neutral (0) passes. Tail-snipe exempt (decided-outcome cushion is its own gate).
   REVERSAL_HOLD_S: Number(process.env.REVERSAL_HOLD_S || 12), // v2.6: reversal must persist this long before exit (anti fake-out)
   TAIL_TAU: Number(process.env.TAIL_TAU || 45),           // v2.5 tail-snipe: active in final N seconds
   TAIL_SIGMA: Number(process.env.TAIL_SIGMA || 1.5),      // require price >= this many sigma past strike
@@ -654,6 +655,7 @@ function decideEntry(o){
   if(Number.isFinite(book.yesAsk)&&book.yesAsk>0.02&&book.yesAsk<0.98){
     const gross=fair-book.yesAsk;
     const net=gross-takerFee(book.yesAsk,1);
+    if(CFG.DRIFT_GATE&&drift<0&&net>=edgeMin)return{action:'NONE',reason:'drift sign gate: YES vs downdrift '+round(drift,3)+' (fitted veto)'};
     if(counterTrend('YES')&&net<CFG.EDGE_MIN_TAKER_HV)return{action:'NONE',reason:'counter-trend YES needs edge >= '+CFG.EDGE_MIN_TAKER_HV+' (drift '+round(drift,3)+')'};
     if(net>=edgeMin){
       if(!cushionOK('YES'))return{action:'NONE',reason:'real cushion only '+round(realCushionSigma,2)+' sigma (need '+CFG.MIN_CUSHION_SIGMA+') — fair is drift-manufactured'};
@@ -672,6 +674,7 @@ function decideEntry(o){
   if(Number.isFinite(book.noAsk)&&book.noAsk>0.02&&book.noAsk<0.98){
     const gross=(1-fair)-book.noAsk;
     const net=gross-takerFee(book.noAsk,1);
+    if(CFG.DRIFT_GATE&&drift>0&&net>=edgeMin)return{action:'NONE',reason:'drift sign gate: NO vs updrift '+round(drift,3)+' (fitted veto)'};
     if(counterTrend('NO')&&net<CFG.EDGE_MIN_TAKER_HV)return{action:'NONE',reason:'counter-trend NO needs edge >= '+CFG.EDGE_MIN_TAKER_HV+' (drift '+round(drift,3)+')'};
     if(net>=edgeMin){
       if(!cushionOK('NO'))return{action:'NONE',reason:'real cushion only '+round(-realCushionSigma,2)+' sigma (need '+CFG.MIN_CUSHION_SIGMA+') — fair is drift-manufactured'};
@@ -1032,7 +1035,7 @@ function runSelfTest(){
     tauSec:427,inHV:false,sentPressure:0,haveOpen:false,driftBps:-0.1255,
     price:65711,strike:65718.69,volBps:0.286,fairStreak:99});
   C.push({name:'v3.3 BLOCKS the real bad trade (0.18 sigma, "0.973" fair)',
-    pass:badTrade.action==='NONE'&&/real cushion/.test(badTrade.reason),got:badTrade.action+' '+(badTrade.reason||'')});
+    pass:badTrade.action==='NONE'&&/(real cushion|drift sign gate)/.test(badTrade.reason),got:badTrade.action+' '+(badTrade.reason||'')});
   // a genuinely cushioned favorite still trades: price $150 above strike, tau 400, vol 0.3 -> ~1.9 sigma
   const goodTrade=decideEntry({fair:0.92,book:{yesAsk:0.80,noAsk:0.12,yesBid:0.78,noBid:0.10},
     tauSec:400,inHV:false,sentPressure:0,haveOpen:false,driftBps:0.02,
@@ -1126,9 +1129,18 @@ function runSelfTest(){
   C.push({name:'v2.5 tail-snipe respects reversal lockout',pass:ts4.action==='NONE',got:ts4.action+' '+(ts4.reason||'')});
   // 18d: v2.4 counter-trend stiffening — fighting a persistent trend needs the HV bar
   const ct1=decideEntry({fair:0.90,book:{yesAsk:0.82,noAsk:0.1,yesBid:0.80,noBid:0.08},tauSec:400,inHV:false,sentPressure:0,haveOpen:false,driftBps:-0.20});
-  C.push({name:'v2.4 counter-trend YES with thin edge REJECTED',pass:ct1.action==='NONE'&&/counter-trend/.test(ct1.reason),got:ct1.action+' '+ct1.reason});
+  C.push({name:'v2.4 counter-trend YES with thin edge REJECTED',pass:ct1.action==='NONE'&&/(counter-trend|drift sign gate)/.test(ct1.reason),got:ct1.action+' '+ct1.reason});
   const ct2=decideEntry({fair:0.95,book:{yesAsk:0.80,noAsk:0.1,yesBid:0.78,noBid:0.08},tauSec:400,inHV:false,sentPressure:0,haveOpen:false,driftBps:-0.20});
-  C.push({name:'v2.4 counter-trend YES with BIG edge still trades',pass:/BUY_YES|POST_YES_BID/.test(ct2.action),got:ct2.action+' '+(ct2.reason||'')});
+  C.push({name:'v4.1 drift gate now BLOCKS counter-drift YES even with big edge (supersedes v2.4 pass-through)',pass:ct2.action==='NONE'&&/drift sign gate/.test(ct2.reason),got:ct2.action+' '+(ct2.reason||'')});
+  // v4.1 DRIFT SIGN GATE — fitted on 282 truth-anchored live trades (7/23-7/26)
+  const dg1=decideEntry({fair:0.05,book:{yesAsk:0.95,noAsk:0.70,yesBid:0.93,noBid:0.68},tauSec:400,inHV:false,sentPressure:0,haveOpen:false,driftBps:0.03,price:65850,strike:66000,volBps:0.3,fairStreak:99});
+  C.push({name:'v4.1 gate BLOCKS NO into updrift (the -$0.56/t bucket)',pass:dg1.action==='NONE'&&/drift sign gate/.test(dg1.reason),got:dg1.action+' '+(dg1.reason||'')});
+  const dg2=decideEntry({fair:0.05,book:{yesAsk:0.95,noAsk:0.70,yesBid:0.93,noBid:0.68},tauSec:400,inHV:false,sentPressure:0,haveOpen:false,driftBps:-0.03,price:65850,strike:66000,volBps:0.3,fairStreak:99});
+  C.push({name:'v4.1 gate PASSES NO with aligned downdrift',pass:/BUY_NO|POST_NO_BID/.test(dg2.action),got:dg2.action+' '+(dg2.reason||'')});
+  const dg3=decideEntry({fair:0.92,book:{yesAsk:0.80,noAsk:0.12,yesBid:0.78,noBid:0.10},tauSec:400,inHV:false,sentPressure:0,haveOpen:false,driftBps:0,price:66150,strike:66000,volBps:0.3,fairStreak:99});
+  C.push({name:'v4.1 neutral drift (0) passes — gate only fires on adverse sign',pass:/BUY_YES|POST_YES_BID/.test(dg3.action),got:dg3.action+' '+(dg3.reason||'')});
+  const dg4=decideEntry({fair:0.99,book:{yesAsk:0.95,noAsk:0.06,yesBid:0.94,noBid:0.04},tauSec:30,inHV:false,sentPressure:0,haveOpen:false,price:66200,strike:66000,volBps:0.5,driftBps:-0.05});
+  C.push({name:'v4.1 tail-snipe EXEMPT from drift gate (decided outcome)',pass:dg4.action==='BUY_YES'&&/tail-snipe/.test(dg4.reason),got:dg4.action+' '+(dg4.reason||'')});
   const ct3=decideEntry({fair:0.90,book:{yesAsk:0.82,noAsk:0.1,yesBid:0.80,noBid:0.08},tauSec:400,inHV:false,sentPressure:0,haveOpen:false,driftBps:+0.20});
   C.push({name:'v2.4 WITH-trend YES thin edge trades normally',pass:/BUY_YES|POST_YES_BID/.test(ct3.action),got:ct3.action+' '+(ct3.reason||'')});
   const ct4=decideEntry({fair:0.90,book:{yesAsk:0.82,noAsk:0.1,yesBid:0.80,noBid:0.08},tauSec:400,inHV:false,sentPressure:0,haveOpen:false,driftBps:0.05});
