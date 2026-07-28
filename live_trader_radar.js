@@ -1,10 +1,33 @@
 /* =====================================================================
-   BTC SHADOW TRADER v1.0 — Phase 1 autonomous trading brain (NO REAL ORDERS)
-   Makes every decision a live bot would make on Kalshi 15-min BTC markets —
-   entries, sizing, exits, settlement — but LOGS trades instead of placing
-   them. Purpose: prove positive expectancy before any dollar is at risk.
+   BTC LIVE TRADER v3.6 — post-mortem fixes from 2026-07-27 (-$32.24 true)
+   v3.6 CHANGES (all data-derived from the 70-trade 7/27 log):
+     F1 SYMMETRIC CALIBRATION: v2.7 linear cal (1.176f - 0.200) was fitted to
+        shrink HIGH-side confidence but, applied to raw YES-fair, it FLOORS any
+        raw fair <= 0.174 to 0.005 => NO-side reads 99.5% conf. 40/70 trades
+        entered at "0.995", won 67.5%, lost $29.71. Fix: calibrate CONFIDENCE
+        (max(f,1-f)) and mirror, so both sides shrink and neither inflates.
+     F2 SATURATION GATE: raw computeFair pinned at its clamp (>=0.995/<=0.005)
+        means "no information", not "certainty". Normal taker entries on a
+        pinned raw fair are rejected. (Tail-snipe exempt: it has its own
+        >=1.5-sigma REAL cushion requirement.)
+     F3 ENTRY PRICE CAP (MAX_ENTRY_PX=0.85): above 0.85 the win/loss payoff
+        (avg +$1.22 / -$4.98) needs >80.5% wr; realized 72.9%. The 0.86-0.93
+        bucket bled -$19+. Counterfactual with cap + F1/F2: +$5.72 vs -$32.24.
+     F4 HONEST RISK ACCOUNTING: (a) LIVE.realizedToday was never written by any
+        trade path — the $ LIVE_DAILY_LOSS killswitch was dead code; now every
+        settled close and every reconcile correction flows into BOTH the shadow
+        cage and LIVE.realizedToday. (b) Near-strike settlements (|margin| <
+        NEAR_STRIKE_USD) are booked as a LOSS for risk purposes until Kalshi
+        reconcile confirms — corrections landed -$22 AFTER the fact on 7/27 and
+        the limit never tripped (booked -$10, true -$32).
+     F5 SETTLEMENT BASIS: default SETTLE_METRIC now 'avg60'. Scored against
+        Kalshi's official results on 7/27: avg60 68/70 correct, last 65/70;
+        on the 5 corrected trades avg60 was right 4/5, last 0/5.
+     F6 SESSION SKIP (SKIP_SESSIONS=midday default): midday ran 64.3% wr,
+        -$17.78 — worst of four sessions.
+   ---------------------------------------------------------------------
    EDGE STACK (from PANews 1.05M-trade study + our sentinel work):
-     E1 late-window convergence: settlement = 60s average → progressively
+     E1 late-window convergence: settlement = 60s average -> progressively
         locked-in; fair value becomes near-certain while book lags
      E2 panic-liquidity capture: rest shadow bids below fair into the
         documented retail panic-exit flow (median exit 0.247)
@@ -15,7 +38,7 @@
      E5 machine risk control: hard daily stop, fixed size, consecutive-loss
         bench, no averaging down, no hope-holds
    Zero dependencies. Deploy as its own Render service:
-     Start Command: node shadow_trader.js
+     Start Command: node live-trader-3.6.js
    Endpoints: /health /selftest /status /report /log /halt?on=1|0
    ===================================================================== */
 'use strict';
@@ -23,22 +46,11 @@ const http = require('http');
 const fs = require('fs');
 const { URL } = require('url');
 const crypto = require('crypto');
+
 const PORT = Number(process.env.PORT || 10000);
-const VERSION = 'live-trader-4.5-pricefloor';
+const VERSION = 'live-trader-4.0';
 const KALSHI_BASE = (process.env.KALSHI_BASE || 'https://api.elections.kalshi.com/trade-api/v2').replace(/\/+$/,'');
 const LOG_PATH = process.env.LOG_PATH || '/tmp/shadow_trades.jsonl';
-
-/* --------- process-level guards: turn silent crashes into logged, survivable events ---------
-   Without these, an unhandled promise rejection (default since Node 15) or an exception thrown
-   inside an event-emitter callback kills the process — which on Render shows up as the
-   boot -> banner -> die -> restart loop that produces intermittent 502s. Log the real reason
-   (to stderr AND to /log) and stay alive; a bad tick is recoverable, a dead process is not. */
-function fatalLog(ev, e){
-  try{ fs.appendFileSync(LOG_PATH, JSON.stringify({ev, err:String((e&&e.stack)||e), ts:Date.now()})+'\n'); }catch(_){}
-  try{ console.error(ev, e); }catch(_){}
-}
-process.on('uncaughtException', (e)=>fatalLog('FATAL_UNCAUGHT', e));
-process.on('unhandledRejection', (r)=>fatalLog('FATAL_REJECTION', r));
 
 /* ------------------------------ config ------------------------------ */
 const CFG = {
@@ -47,11 +59,6 @@ const CFG = {
   MAX_CONSEC_LOSSES: Number(process.env.MAX_CONSEC_LOSSES || 4), // bench for the day
   EDGE_MIN_TAKER: Number(process.env.EDGE_MIN_TAKER || 0.06),    // fair-vs-price cushion, normal
   EDGE_MIN_TAKER_HV: Number(process.env.EDGE_MIN_TAKER_HV || 0.10), // high-variance sub-window
-  WS_ENABLED: !/^(0|false|no)$/i.test(process.env.WS_ENABLED||''),   // v4.0 websocket book feed
-  WS_URL: process.env.WS_URL || 'wss://api.elections.kalshi.com/trade-api/ws/v2',
-  MAKER_FIRST: !/^(0|false|no)$/i.test(process.env.MAKER_FIRST||''),
-  MAKER_UNDERCUT: Number(process.env.MAKER_UNDERCUT || 0.01),
-  MAKER_WAIT_S: Number(process.env.MAKER_WAIT_S || 45),
   MAKER_EDGE_MIN: Number(process.env.MAKER_EDGE_MIN || 0.08),    // rest bids this far below fair
   MAKER_WINDOW_S: Number(process.env.MAKER_WINDOW_S || 180),     // panic-capture active in final N s
   SENT_VETO: Number(process.env.SENT_VETO || 40),                // |perp pressure| that vetoes opposing entry
@@ -59,8 +66,7 @@ const CFG = {
   EXIT_FAIR_DROP: Number(process.env.EXIT_FAIR_DROP || 0.25),    // + fair collapse vs entry to confirm
   TAKER_FEE_K: Number(process.env.TAKER_FEE_K || 0.07),          // Kalshi taker: 0.07*P*(1-P)/contract
   MAKER_FEE: Number(process.env.MAKER_FEE || 0.003),             // $/contract maker
-  MIN_TAU_ENTER: Number(process.env.MIN_TAU_ENTER || 8),
-  MIN_PRICE: Number(process.env.MIN_PRICE || 0.65),        // v4.5 PRICE FLOOR: asks below this win ~51% (coin flips) — the model's fair is most inflated exactly where the ask is cheap (market disagrees most). Cutting them: +$24.49 post-drift on 275 truth-anchored trades; logistic coef on price +4.54, strongest single predictor. Robust 0.62-0.68.         // no fresh entries in final N s
+  MIN_TAU_ENTER: Number(process.env.MIN_TAU_ENTER || 8),         // no fresh entries in final N s
   MAX_TAU_ENTER: Number(process.env.MAX_TAU_ENTER || 600),       // ignore markets >10 min out
   TRADE_ALL_HOURS: !/^(1|true|yes)$/i.test(process.env.PRIME_ONLY||''), // 24/7 by default; PRIME_ONLY=1 restores gate
   FAIR_MIN_HI: Number(process.env.FAIR_MIN_HI || 0.85),   // v2.0 filter: take taker trades with fair >= this
@@ -71,17 +77,13 @@ const CFG = {
   KALSHI_PRIVATE_KEY: (process.env.KALSHI_PRIVATE_KEY||'').replace(/\\n/g,'\n'),
   LIVE_DAILY_LOSS: Number(process.env.LIVE_DAILY_LOSS || 100), // hard $ stop for REAL money
   LIVE_MAX_CONTRACTS: Number(process.env.LIVE_MAX_CONTRACTS || 50), // absolute per-order cap
-  CAL_A: Number(process.env.CAL_A ?? 0),                  // v4.3: IDENTITY. Post-hoc cal retired — overconfidence fixed at the SOURCE via VOL_SCALE.
-  CAL_B: Number(process.env.CAL_B ?? 1),
-  CAL_CEIL: Number(process.env.CAL_CEIL || 0.995),
-  VOL_SCALE: Number(process.env.VOL_SCALE || 1.3),        // v4.3 TRUE SIGMA: tape vol understates settlement-horizon vol (measured std(z)=1.5 on 275 trades; Brier-optimal k=1.3). Applied inside computeFair. Result: printed 0.90-0.95 wins 90%, 0.95+ wins 93% (validated). Honest 0.95 now requires 2.1 measured-sigma cushion.
+  CAL_A: Number(process.env.CAL_A ?? -0.200),             // v2.7 calibration: corrected = CAL_B*fair + CAL_A
+  CAL_B: Number(process.env.CAL_B ?? 1.176),              // fit on 190 real settled trades (orig+current), Brier 0.133->0.128
   CAL_ON: !/^(0|false|no)$/i.test(process.env.CAL_ON||''), // on by default
   RADAR_URL: process.env.RADAR_URL||'',        // v3.4: pin-radar status endpoint (observation only)
-   RADAR_MIN_SPOTIMB: Number(process.env.RADAR_MIN_SPOTIMB ?? 0),
   MIN_CUSHION_SIGMA: Number(process.env.MIN_CUSHION_SIGMA || 1.0), // v3.3: price must be this many sigma past strike, DRIFT EXCLUDED
   FAIR_STABLE_N: Number(process.env.FAIR_STABLE_N || 3),           // v3.3: fair must clear the band this many consecutive reads
   TREND_BPS: Number(process.env.TREND_BPS || 0.15),
-  DRIFT_GATE: !/^(0|false|no)$/i.test(process.env.DRIFT_GATE||''), // v4.1: hard sign-alignment veto (fitted 7/23-7/26, 282 truth-anchored trades): NO blocked when drift>0, YES blocked when drift<0. Counterfactual: +$19.40 over 4 days, $/trade 0.205->0.329 on settled. Neutral (0) passes. Tail-snipe exempt (decided-outcome cushion is its own gate).
   REVERSAL_HOLD_S: Number(process.env.REVERSAL_HOLD_S || 12), // v2.6: reversal must persist this long before exit (anti fake-out)
   TAIL_TAU: Number(process.env.TAIL_TAU || 45),           // v2.5 tail-snipe: active in final N seconds
   TAIL_SIGMA: Number(process.env.TAIL_SIGMA || 1.5),      // require price >= this many sigma past strike
@@ -89,15 +91,29 @@ const CFG = {
   COOLDOWN_S: Number(process.env.COOLDOWN_S || 120),       // suppress entries N s after a violent move / reversal exit
   COOLDOWN_SIGMA: Number(process.env.COOLDOWN_SIGMA || 2.0), // "violent" = fair moved > this many sigma vs entry, or a reversal fired
   RISK_DOLLARS: Number(process.env.RISK_DOLLARS || 0),    // v2.3 LADDER: 0=flat shadow. Live: start 25, then 50/100/200/400 every ~50 trades while watching return-on-risk.
-  SETTLE_METRIC: (process.env.SETTLE_METRIC || 'last'),   // 'last' (point-in-time, Kalshi-confirmed) or 'avg60' (legacy)
-  KALSHI_SETTLE: !/^(0|false|no)$/i.test(process.env.KALSHI_SETTLE||''),   // v4.4: near the strike the proxy tape and Kalshi's official BRTI disagree (source of every CORRECTION). When |margin| < KALSHI_SETTLE_BAND, DON'T guess with the tape — wait for Kalshi's official result and settle on that. Away from the strike the tape is reliable, settle immediately. On by default.
-  KALSHI_SETTLE_BAND: Number(process.env.KALSHI_SETTLE_BAND || 15),   // $ from strike within which we defer to Kalshi truth instead of the proxy tape
-  KALSHI_SETTLE_WAIT: Number(process.env.KALSHI_SETTLE_WAIT || 90),   // max seconds to wait for Kalshi's result before falling back to the tape (never strand a position)
+  SETTLE_METRIC: (process.env.SETTLE_METRIC || 'avg60'),  // v3.6 F5: DEFAULT avg60 — Kalshi settles on the 60s average. Scored 7/27: avg60 68/70, last 65/70; on the 5 corrections avg60 4/5, last 0/5.
+  SKIP_SESSIONS: String(process.env.SKIP_SESSIONS ?? 'midday'), // v3.6 F6: comma-separated sessions with no entries (midday: 64.3% wr, -$17.78 on 7/27)
+  NEAR_STRIKE_USD: Number(process.env.NEAR_STRIKE_USD || 15), // v3.6 F4b: settlements within this $ of strike book as LOSS for risk until Kalshi confirms
+  // v3.7 — refit on 345 pooled trades (7/23-7/27), replacing 1-day fits.
+  MIN_ENTRY_PX: Number(process.env.MIN_ENTRY_PX ?? 0.76),  // v3.7 F3: edge is a BAND. px<0.76 lost -$12.24 over 159 trades (69% wr).
+  MAX_ENTRY_PX: Number(process.env.MAX_ENTRY_PX ?? 0.85),  // px in [0.76,0.85] = 86% wr, +$41.53 (n=130). >0.85 lost -$5.28.
+  VOL_SKIP_LO: Number(process.env.VOL_SKIP_LO ?? 0.35),    // v3.7 F7: pain band A. vol 0.35-0.38 = 63% wr, -$30.35 (n=24).
+  VOL_SKIP_HI: Number(process.env.VOL_SKIP_HI ?? 0.38),
+  VOL_SKIP2_LO: Number(process.env.VOL_SKIP2_LO ?? 0.50),  // pain band B. vol 0.50-0.60 = 71% wr, -$5.69 (n=14). >=0.60 is FINE (94% wr).
+  VOL_SKIP2_HI: Number(process.env.VOL_SKIP2_HI ?? 0.60),
+  DRIFT_OPPOSE_MIN: Number(process.env.DRIFT_OPPOSE_MIN ?? 0.02), // v3.9 F9: reject entries whose side OPPOSES the drift when |drift|>=this.
+  JEWEL_MULT: Number(process.env.JEWEL_MULT ?? 1.5),    // v4.0 F11: size multiplier for the highest-EV cell. On 345 pooled trades the
+  JEWEL_PX_MIN: Number(process.env.JEWEL_PX_MIN ?? 0.80),// cell px>=0.80 & tau>=450 ran 97% wr, $0.141/contract, POSITIVE ALL 5 DAYS
+  JEWEL_TAU_MIN: Number(process.env.JEWEL_TAU_MIN ?? 450),// (rest of book $0.05). x1.5 sizing: +30% total pnl, beats baseline in 100%
+                                                          // of 10k bootstrap weeks, worst day IMPROVES. 1.0 disables.
+                                                                   // Pooled 345: bet-against-drift (|d|>=0.02) = 80% wr, -$0.17 net; the
+                                                                   // low-band+against pocket ran 40% wr, -$2.45/trade. 0 = gate off.
   PRIME_START: process.env.PRIME_START || '05:30',               // PT
   PRIME_END: process.env.PRIME_END || '09:00',                   // PT
   HV_START: process.env.HV_START || '05:45',                     // PT (= 8:45 ET)
   HV_END: process.env.HV_END || '06:30',                         // PT (= 9:30 ET)
 };
+
 /* ----------------------------- helpers ----------------------------- */
 function clamp(x,lo,hi){const n=Number(x);return Number.isFinite(n)?Math.max(lo,Math.min(hi,n)):lo;}
 function round(x,d=4){const n=Number(x);return Number.isFinite(n)?Number(n.toFixed(d)):null;}
@@ -132,9 +148,26 @@ function sessionTag(nowMin){ // PT buckets for per-session P&L breakdown
   if(nowMin<hm('13:00'))return'midday';
   return'evening';
 }
+function sessionSkipped(tag){ // v3.6 F6
+  return CFG.SKIP_SESSIONS.split(',').map(s=>s.trim().toLowerCase()).filter(Boolean).includes(String(tag).toLowerCase());
+}
+/* v3.6 F1 — SYMMETRIC calibration. The v2.7 linear map (CAL_B*f + CAL_A) was
+   fitted to shrink HIGH confidence (0.95 -> 0.917). Applied to a raw YES-fair
+   directly, it FLOORS every raw fair <= (0.005-CAL_A)/CAL_B ~= 0.174 to 0.005,
+   which the NO side then reads as 0.995 confidence — it INFLATED exactly the
+   trades it was meant to police (40 of 70 on 7/27, 67.5% wr at claimed 99.5%).
+   Fix: calibrate the CONFIDENCE max(f,1-f) and mirror back, so both sides are
+   shrunk toward reality and neither side can be inflated by the transform. */
+function calFair(f){
+  if(f===null||!Number.isFinite(f))return f;
+  const hi=x=>Math.max(0.005,Math.min(0.995,CFG.CAL_B*x+CFG.CAL_A));
+  return f>=0.5 ? hi(f) : 1-hi(1-f);
+}
+
 /* --------------------- fees (Kalshi model) --------------------- */
 function takerFee(price,qty){return CFG.TAKER_FEE_K*price*(1-price)*qty;}
 function makerFee(qty){return CFG.MAKER_FEE*qty;}
+
 /* --------------- BRTI proxy tape (Coinbase/Kraken/Bitstamp) --------------- */
 const TAPE=[]; // [ts, price] rolling ~20 min
 let lastTapeErr=null;
@@ -182,6 +215,7 @@ function tapeAvg(fromTs,toTs){ // time-weighted avg over [fromTs,toTs]
   for(let i=1;i<w.length;i++){const dt=(w[i][0]-w[i-1][0])/1000;sum+=w[i-1][1]*dt;dur+=dt;}
   return dur>0?sum/dur:null;
 }
+
 /* --------------- upstream sentinel (Binance perp, compact) --------------- */
 function ewmaZ(a){let m=null,v=null;return{update(x){if(m===null){m=x;v=1e-9;return 0;}const d=x-m;m+=a*d;v=(1-a)*(v+a*d*d);return d/Math.sqrt(Math.max(v,1e-9));}};}
 const z2s=z=>clamp(z/3.5,-1,1)*100;
@@ -265,122 +299,11 @@ async function sentPoll(){
     }
     if(any)SENT.lastOk=now;
   }catch(_){}
-  try{ SENT.read=sentCompute(); if(SENT.read)SENT.read.venue=SENT.venue||null; }catch(_){}
+  SENT.read=sentCompute();
+  if(SENT.read)SENT.read.venue=SENT.venue||null;
 }
-function ensureSentinel(){if(SENT.started)return;SENT.started=true;sentPoll().catch(()=>{});const t=setInterval(()=>{sentPoll().catch(()=>{});},2500);if(t.unref)t.unref();}
-/* ==================== v4.0 WEBSOCKET BOOK FEED ====================
-   Replaces the 2s REST poll for order-book data with a live stream.
-   - auth: RSA-PSS over `{ts}GET/trade-api/ws/v2` on the upgrade handshake
-   - channels: orderbook_delta (book) + fill (real execution confirmations)
-   - seq gaps => local book is CORRUPT => stop trading, resubscribe, await snapshot
-   - read-only: orders still go over REST
-=================================================================== */
-let WebSocketLib=null;
-try{ WebSocketLib=require('ws'); }catch(_){ /* dependency missing -> WS disabled, REST fallback */ }
-const WS={
-  sock:null, ready:false, seq:null, ticker:null, corrupt:false,
-  book:{yes:new Map(), no:new Map()},          // price(cents) -> qty
-  lastMsgTs:0, reconnects:0, gaps:0, fills:[], err:null, subId:1, lastSnap:null, lastDelta:null, msgTypes:{}
-};
-function wsBookTouch(){
-  // Kalshi single book: yes[] and no[] are BID ladders. Best ask on one side = 1 - best bid on the other.
-  let yb=null, nb=null;
-  for(const [p,q] of WS.book.yes) if(q>0 && (yb===null||p>yb)) yb=p;
-  for(const [p,q] of WS.book.no)  if(q>0 && (nb===null||p>nb)) nb=p;
-  if(yb===null&&nb===null)return null;
-  const yesBid = yb!==null? round(yb/10000,4) : null;
-  const noBid  = nb!==null? round(nb/10000,4) : null;
-  return {
-    yesBid, noBid,
-    yesAsk: noBid!==null? round(1-noBid,4) : null,
-    noAsk:  yesBid!==null? round(1-yesBid,4) : null,
-    yesDepth:[...WS.book.yes.values()].reduce((a,b)=>a+b,0),
-    noDepth:[...WS.book.no.values()].reduce((a,b)=>a+b,0),
-    source:'websocket'
-  };
-}
-function wsApplySnapshot(m){
-  // Kalshi wire format (confirmed live): yes_dollars_fp / no_dollars_fp = [[priceStr, qtyStr], ...]
-  WS.book.yes.clear(); WS.book.no.clear();
-  const key=(v)=>Math.round(Number(v)*10000);   // sub-cent precision
-  const yes = m.yes_dollars_fp || m.yes_dollars || m.yes || [];
-  const no  = m.no_dollars_fp  || m.no_dollars  || m.no  || [];
-  if(yes.length===0 && no.length===0){        // expired/closed market: empty book
-    WS.corrupt=true; WS.emptySnapshots=(WS.emptySnapshots||0)+1;
-    logLine({ev:'WS_EMPTY_BOOK',ticker:m.market_ticker,note:'market closed or not yet quoting'});
-    return;
-  }
-  for(const lvl of yes){const p=key(lvl[0]), q=Number(lvl[1]); if(Number.isFinite(q)&&q>0)WS.book.yes.set(p,q);}
-  for(const lvl of no ){const p=key(lvl[0]), q=Number(lvl[1]); if(Number.isFinite(q)&&q>0)WS.book.no.set(p,q);}
-  WS.corrupt=false;
-}
-function wsApplyDelta(m){
-  // price_dollars is a sub-cent dollar string ("0.9010"); key at 1/100-cent precision
-  const raw = (m.price_dollars!==undefined? m.price_dollars : m.price);
-  const rd  = Number(raw);
-  if(!Number.isFinite(rd))return;
-  const p = Math.round((rd<=1.0001? rd : rd/100)*10000);
-  const d = Number(m.delta_fp!==undefined?m.delta_fp:(m.delta!==undefined?m.delta:m.quantity_delta));
-  if(!Number.isFinite(d))return;
-  const side = (m.side==='no') ? WS.book.no : WS.book.yes;
-  const cur=side.get(p)||0, next=cur+d;
-  if(next<=0.0001) side.delete(p); else side.set(p,next);
-}
-function wsSubscribe(ticker){
-  if(!WS.sock||WS.sock.readyState!==1||!ticker)return;
-  WS.ticker=ticker; WS.seq=null; WS.corrupt=true;   // corrupt until snapshot arrives
-  WS.book.yes.clear(); WS.book.no.clear();
-  WS.sock.send(JSON.stringify({id:WS.subId++,cmd:'subscribe',
-    params:{channels:['orderbook_delta'],market_tickers:[ticker]}}));
-  WS.sock.send(JSON.stringify({id:WS.subId++,cmd:'subscribe',params:{channels:['fill']}}));
-  logLine({ev:'WS_SUBSCRIBE',ticker});
-}
-function wsConnect(){
-  if(!CFG.WS_ENABLED||!WebSocketLib||!liveReady())return;
-  try{
-    const headers=signRequest('GET','/trade-api/ws/v2');
-    const s=new WebSocketLib(CFG.WS_URL,{headers});
-    WS.sock=s;
-    s.on('open',()=>{WS.ready=true;WS.err=null;logLine({ev:'WS_OPEN',url:CFG.WS_URL});if(WS.ticker)wsSubscribe(WS.ticker);});
-    s.on('message',(raw)=>{ try{
-      WS.lastMsgTs=Date.now();
-      let j=null; try{ j=JSON.parse(raw.toString()); }catch(_){ return; }
-      const t=j.type;
-      WS.msgTypes[t]=(WS.msgTypes[t]||0)+1;
-      if(t==='orderbook_snapshot')WS.lastSnap=j;
-      if(t==='orderbook_delta'&&!WS.lastDelta)WS.lastDelta=j;
-      if(t==='orderbook_snapshot'){ wsApplySnapshot(j.msg||{}); WS.seq=j.seq; }
-      else if(t==='orderbook_delta'){
-        if(WS.seq!==null && j.seq!==WS.seq+1){        // SEQUENCE GAP -> book untrustworthy
-          WS.gaps++; WS.corrupt=true;
-          logLine({ev:'WS_SEQ_GAP',expected:WS.seq+1,got:j.seq});
-          wsSubscribe(WS.ticker);                      // resubscribe for a fresh snapshot
-          return;
-        }
-        WS.seq=j.seq; wsApplyDelta(j.msg||{});
-      }
-      else if(t==='fill'){
-        const m=j.msg||{};
-        WS.fills.push({ticker:m.market_ticker,count:m.count,price:m.price,side:m.side,ts:Date.now()});
-        if(WS.fills.length>100)WS.fills.shift();
-        logLine({ev:'WS_FILL',ticker:m.market_ticker,count:m.count,price:m.price,side:m.side});
-      }
-    }catch(err){ WS.err='msg handler: '+String((err&&err.message)||err); logLine({ev:'WS_MSG_ERROR',err:WS.err}); } });
-    s.on('ping',()=>{ try{s.pong();}catch(_){} });
-    s.on('error',(e)=>{WS.err=String(e.message||e);logLine({ev:'WS_ERROR',err:WS.err});});
-    s.on('close',()=>{
-      WS.ready=false;WS.corrupt=true;WS.sock=null;WS.reconnects++;
-      logLine({ev:'WS_CLOSE',reconnects:WS.reconnects});
-      setTimeout(wsConnect,Math.min(30000,1000*Math.pow(2,Math.min(5,WS.reconnects))));
-    });
-  }catch(e){ WS.err=String(e.message||e); setTimeout(wsConnect,5000); }
-}
-function wsHealthy(){
-  // v4.0.1: empty book (expired/closed market) or stale feed => NOT healthy => REST fallback.
-  const hasBook = WS.book.yes.size>0 && WS.book.no.size>0;
-  return CFG.WS_ENABLED && WS.ready && !WS.corrupt && hasBook &&
-         WS.lastMsgTs>0 && (Date.now()-WS.lastMsgTs)<20000;
-}
+function ensureSentinel(){if(SENT.started)return;SENT.started=true;sentPoll();const t=setInterval(sentPoll,2500);if(t.unref)t.unref();}
+
 /* --------------------- PIN RADAR OBSERVER (v3.4) ---------------------
    Fetches the radar's independent signals (spot CVD, Kalshi book imbalance)
    and stamps them on every OPEN. OBSERVATION ONLY — no decision uses these.
@@ -422,8 +345,13 @@ function radarSnapshot(){
   };
 }
 /* --------------------- LIVE ORDER LAYER (v3.0) --------------------- */
-const LIVE={enabled:false,lastErr:null,orders:[],halted:null,realizedToday:0,day:null};
+const LIVE={enabled:false,lastFill:null,lastErr:null,orders:[],halted:null,realizedToday:0,day:null};
 function liveReady(){ return !!(CFG.KALSHI_KEY_ID && CFG.KALSHI_PRIVATE_KEY); }
+function liveRecord(pnl){ // v3.6 F4a: real-money P&L actually flows into the live killswitch now
+  liveHalted();                       // rolls the day if needed
+  if(!Number.isFinite(pnl))return;    // v3.9 F10: NaN guard (see cage.record)
+  LIVE.realizedToday+=pnl;
+}
 function signRequest(method,path){
   // Kalshi RSA-PSS: sign  timestampMs + METHOD + path
   const ts=Date.now().toString();
@@ -458,7 +386,10 @@ async function placeLiveOrder(ticker,side,count,priceCents){
   //   buy YES @ p   -> side 'bid', price p
   //   buy NO  @ q   -> economically SELL YES @ (1-q) -> side 'ask', price (1-q)
   const isYes = side==='yes';
-  const px = isYes ? (priceCents/100) : (1 - priceCents/100);
+  // v3.5: make BOTH sides marketable. bid -> pay 1 tick up; ask -> offer 1 tick down.
+  // Observed: asks priced exactly at the implied YES bid crossed nothing and IOC-cancelled (fill_count 0).
+  const px = isYes ? Math.min(0.99,(priceCents/100)+0.01)
+                   : Math.max(0.01,(1 - priceCents/100)-0.01);
   const order={ticker,
     client_order_id:'bot-'+Date.now()+'-'+Math.floor(Math.random()*1e6),
     side: isYes ? 'bid' : 'ask',
@@ -477,8 +408,12 @@ async function placeLiveOrder(ticker,side,count,priceCents){
   try{
     const res=await kalshiAuthed('POST','/portfolio/events/orders',order);
     const o=res&&(res.order||res);
-    logLine({ev:'LIVE_ORDER',ticker,intentSide:side,v2Side:order.side,price:order.price,count:order.count,
-      orderId:o&&(o.order_id||o.id),status:o&&o.status});
+    const filled=Number((o&&(o.fill_count!==undefined?o.fill_count:o.filled_count))||0);
+    const remaining=Number((o&&o.remaining_count)||0);
+    logLine({ev:filled>0?'LIVE_FILL':'LIVE_NOFILL',ticker,intentSide:side,v2Side:order.side,
+      price:order.price,requested:order.count,filled:filled.toFixed(2),remaining:remaining.toFixed(2),
+      orderId:o&&(o.order_id||o.id)});
+    LIVE.lastFill={ticker,filled,requested:Number(order.count)};
     LIVE.orders.push({ticker,side,v2Side:order.side,price:order.price,count:order.count,ts:Date.now(),res:o});
     if(LIVE.orders.length>100)LIVE.orders.shift();
     return res;
@@ -493,6 +428,7 @@ async function fetchLivePositions(){
   try{ return await kalshiAuthed('GET','/portfolio/positions'); }
   catch(e){ LIVE.lastErr=String(e.message||e); return null; }
 }
+
 /* --------------------- Kalshi market discovery --------------------- */
 let mktCache={t:0,data:null};
 const DISC={ts:0,err:null,totalMarkets:0,btcCount:0,nearestCloseSec:null,picked:null};
@@ -573,6 +509,7 @@ async function getBook(ticker,fallbackQuotes){
   }else if(empty){data.source='none';}
   obCache={t:now,ticker,data};return data;
 }
+
 /* --------------------- fair value engine (E1 core) --------------------- */
 /* P(settlement avg over final 60s > strike).
    tau > 60: terminal distn of the average; effective horizon = (tau-60)+20s
@@ -582,7 +519,7 @@ async function getBook(ticker,fallbackQuotes){
 function computeFair(o){
   const {price,strike,tauSec,volBps,driftBps,knownAvg,knownDur}=o;
   if(!Number.isFinite(price)||!Number.isFinite(strike))return null;
-  const sigUsdPerSqrtSec=(volBps/1e4)*price*(CFG.VOL_SCALE||1);   // v4.3 true-sigma correction
+  const sigUsdPerSqrtSec=(volBps/1e4)*price;
   const driftUsdPerSec=(driftBps/1e4)*price;
   let mean,sd;
   if(tauSec>60){
@@ -600,6 +537,7 @@ function computeFair(o){
   sd=Math.max(1e-6,sigUsdPerSqrtSec*Math.sqrt(r/3));
   return clamp(1-normCdf((reqFutureMean-mean)/sd),0.001,0.999);
 }
+
 /* --------------------- decision engine (E2-E4) --------------------- */
 function decideEntry(o){
   const {fair,book,tauSec,inHV,sentPressure,haveOpen,ticker,lockout}=o;
@@ -633,6 +571,20 @@ function decideEntry(o){
     return side==='YES' ? realCushionSigma>=CFG.MIN_CUSHION_SIGMA
                         : (-realCushionSigma)>=CFG.MIN_CUSHION_SIGMA;
   };
+  // v3.6 F2 SATURATION GATE: raw fair pinned at its clamp means the model has run out of
+  // resolution — "no information", not "certainty". 7/27: 40 pinned entries, 67.5% wr at
+  // claimed 99.5%, -$29.71. Normal taker path rejects them. (Tail-snipe below is exempt:
+  // it independently requires >= TAIL_SIGMA of REAL price distance.)
+  const satYES = Number.isFinite(o.rawFair) && o.rawFair>=0.995;
+  const satNO  = Number.isFinite(o.rawFair) && o.rawFair<=0.005;
+  // v3.6.1 F7 VOL-REGIME GATE: in the 0.35-0.60 bps/sqrt-s band the tape is transitional chop —
+  // moves big enough to cross a ~1-sigma cushion, not trending decisively enough for drift to help,
+  // and the 5-min vol estimate itself lags the regime shift. 7/27 evidence: 19 entries in-band won
+  // 42% at claimed ~90% conf (-$45.42, p<1e-6 vs claim); the other 51 won 84% (+$13.18). Normal
+  // taker entries are skipped in-band. Tail-snipe exempt: its sigma hurdle auto-scales with vol.
+  const volSkip = Number.isFinite(o.volBps) && (
+      (CFG.VOL_SKIP_HI>CFG.VOL_SKIP_LO && o.volBps>=CFG.VOL_SKIP_LO && o.volBps<CFG.VOL_SKIP_HI) ||
+      (CFG.VOL_SKIP2_HI>CFG.VOL_SKIP2_LO && o.volBps>=CFG.VOL_SKIP2_LO && o.volBps<CFG.VOL_SKIP2_HI));
   // v2.4 COUNTER-TREND STIFFENING: in a persistent trend, entries that FIGHT the drift need the HV bar.
   const drift=o.driftBps||0;
   // v2.5 TAIL-SNIPE (sim-validated $1.04/trade; the one structural edge our polling can capture):
@@ -658,47 +610,46 @@ function decideEntry(o){
   const vetoAt=tauSec<=300?25:CFG.SENT_VETO; // late window: respect upstream flow harder
   const edgeMin=inHV?CFG.EDGE_MIN_TAKER_HV:CFG.EDGE_MIN_TAKER;
   // taker YES
-  if(Number.isFinite(book.yesAsk)&&book.yesAsk>=CFG.MIN_PRICE&&book.yesAsk<0.98){
+  if(Number.isFinite(book.yesAsk)&&book.yesAsk>0.02&&book.yesAsk<0.98){
     const gross=fair-book.yesAsk;
     const net=gross-takerFee(book.yesAsk,1);
-    if(CFG.DRIFT_GATE&&drift<0&&net>=edgeMin)return{action:'NONE',reason:'drift sign gate: YES vs downdrift '+round(drift,3)+' (fitted veto)'};
     if(counterTrend('YES')&&net<CFG.EDGE_MIN_TAKER_HV)return{action:'NONE',reason:'counter-trend YES needs edge >= '+CFG.EDGE_MIN_TAKER_HV+' (drift '+round(drift,3)+')'};
     if(net>=edgeMin){
+      // v3.7: saturation gate REMOVED — on 345 pooled trades, claimed>=0.99 was net +$8.52. The 7/27
+      //   'saturation bleed' was really price+vol clustering, now caught by the band and vol gates below.
+      if(volSkip)return{action:'NONE',reason:'vol regime '+round(o.volBps,3)+' in skip band ['+CFG.VOL_SKIP_LO+','+CFG.VOL_SKIP_HI+') — model miscalibrated in transitional chop'};
+      if(book.yesAsk<CFG.MIN_ENTRY_PX||book.yesAsk>CFG.MAX_ENTRY_PX)return{action:'NONE',reason:'entry px '+book.yesAsk+' outside edge band ['+CFG.MIN_ENTRY_PX+','+CFG.MAX_ENTRY_PX+']'};
+      if(CFG.DRIFT_OPPOSE_MIN>0 && drift<=-CFG.DRIFT_OPPOSE_MIN)return{action:'NONE',reason:'YES opposes drift '+round(drift,3)+' (|d|>='+CFG.DRIFT_OPPOSE_MIN+') — against-flow pocket ran 40-80% wr, negative'};
       if(!cushionOK('YES'))return{action:'NONE',reason:'real cushion only '+round(realCushionSigma,2)+' sigma (need '+CFG.MIN_CUSHION_SIGMA+') — fair is drift-manufactured'};
       if(locked&&lockout.side==='YES')return{action:'NONE',reason:'reversal lockout (YES) this window'};
       if(cdSameWindow&&o.lockout.side==='YES')return{action:'NONE',reason:'cooldown same-side YES ('+Math.ceil((o.cooldownUntil-Date.now())/1000)+'s)'};
       if(!inBand(fair))return{action:'NONE',reason:'fair '+round(fair,3)+' outside trade band ['+CFG.FAIR_MAX_LO+','+CFG.FAIR_MIN_HI+']'};
       if(sentPressure<=-vetoAt)return{action:'NONE',reason:'YES edge but perp pressure down (veto @'+vetoAt+')'};
-      if(CFG.MAKER_FIRST&&tauSec>CFG.MAKER_WAIT_S+10&&Number.isFinite(book.yesBid)){
-        const mb=round(Math.max(0.02,book.yesBid+CFG.MAKER_UNDERCUT),2);
-        if(mb<book.yesAsk)return{action:'POST_YES_BID',mode:'maker',px:mb,fair,netEdge:round(fair-mb-CFG.MAKER_FEE,3),reason:'maker-first YES @'+mb+' (taker would pay '+book.yesAsk+')'};
-      }
       return{action:'BUY_YES',mode:'taker',px:book.yesAsk,fair,netEdge:round(net,3),reason:'fair '+round(fair,3)+' vs ask '+book.yesAsk};
     }
   }
   // taker NO
-  if(Number.isFinite(book.noAsk)&&book.noAsk>=CFG.MIN_PRICE&&book.noAsk<0.98){
+  if(Number.isFinite(book.noAsk)&&book.noAsk>0.02&&book.noAsk<0.98){
     const gross=(1-fair)-book.noAsk;
     const net=gross-takerFee(book.noAsk,1);
-    if(CFG.DRIFT_GATE&&drift>0&&net>=edgeMin)return{action:'NONE',reason:'drift sign gate: NO vs updrift '+round(drift,3)+' (fitted veto)'};
     if(counterTrend('NO')&&net<CFG.EDGE_MIN_TAKER_HV)return{action:'NONE',reason:'counter-trend NO needs edge >= '+CFG.EDGE_MIN_TAKER_HV+' (drift '+round(drift,3)+')'};
     if(net>=edgeMin){
+      // v3.7: saturation gate REMOVED (see YES branch note).
+      if(volSkip)return{action:'NONE',reason:'vol regime '+round(o.volBps,3)+' in skip band ['+CFG.VOL_SKIP_LO+','+CFG.VOL_SKIP_HI+') — model miscalibrated in transitional chop'};
+      if(book.noAsk<CFG.MIN_ENTRY_PX||book.noAsk>CFG.MAX_ENTRY_PX)return{action:'NONE',reason:'entry px '+book.noAsk+' outside edge band ['+CFG.MIN_ENTRY_PX+','+CFG.MAX_ENTRY_PX+']'};
+      if(CFG.DRIFT_OPPOSE_MIN>0 && drift>=CFG.DRIFT_OPPOSE_MIN)return{action:'NONE',reason:'NO opposes drift +'+round(drift,3)+' (|d|>='+CFG.DRIFT_OPPOSE_MIN+') — against-flow pocket ran 40-80% wr, negative'};
       if(!cushionOK('NO'))return{action:'NONE',reason:'real cushion only '+round(-realCushionSigma,2)+' sigma (need '+CFG.MIN_CUSHION_SIGMA+') — fair is drift-manufactured'};
       if(locked&&lockout.side==='NO')return{action:'NONE',reason:'reversal lockout (NO) this window'};
       if(cdSameWindow&&o.lockout.side==='NO')return{action:'NONE',reason:'cooldown same-side NO ('+Math.ceil((o.cooldownUntil-Date.now())/1000)+'s)'};
       if(!inBand(1-fair))return{action:'NONE',reason:'fair(no) '+round(1-fair,3)+' outside trade band ['+CFG.FAIR_MAX_LO+','+CFG.FAIR_MIN_HI+']'};
       if(sentPressure>=vetoAt)return{action:'NONE',reason:'NO edge but perp pressure up (veto @'+vetoAt+')'};
-      if(CFG.MAKER_FIRST&&tauSec>CFG.MAKER_WAIT_S+10&&Number.isFinite(book.noBid)){
-        const mb=round(Math.max(0.02,book.noBid+CFG.MAKER_UNDERCUT),2);
-        if(mb<book.noAsk)return{action:'POST_NO_BID',mode:'maker',px:mb,fair,netEdge:round((1-fair)-mb-CFG.MAKER_FEE,3),reason:'maker-first NO @'+mb+' (taker would pay '+book.noAsk+')'};
-      }
       return{action:'BUY_NO',mode:'taker',px:book.noAsk,fair,netEdge:round(net,3),reason:'fair(no) '+round(1-fair,3)+' vs ask '+book.noAsk};
     }
   }
   // maker panic-capture (final window only): rest a YES bid well below fair
   if(tauSec<=CFG.MAKER_WINDOW_S&&fair>=0.35&&fair<=0.9&&!(locked&&lockout.side==='YES')){
     const bid=round(Math.max(0.02,fair-CFG.MAKER_EDGE_MIN),2);
-    if(bid>=CFG.MIN_PRICE&&Number.isFinite(book.yesAsk)&&bid<book.yesAsk)
+    if(Number.isFinite(book.yesAsk)&&bid<book.yesAsk)
       return{action:'POST_YES_BID',mode:'maker',px:bid,fair,netEdge:round(fair-bid-CFG.MAKER_FEE,3),reason:'panic-capture bid '+bid+' vs fair '+round(fair,3)};
   }
   return{action:'NONE',reason:'no edge ≥ '+edgeMin};
@@ -718,12 +669,14 @@ function decideExit(o){ // firm stay-in: exit ONLY on a PERSISTENT confirmed rev
     return{exit:true,cond:true,reason:'confirmed reversal ('+Math.round(heldMs/1000)+'s persist): perp '+sentPressure+', fair '+round(pos.entryFair,2)+'→'+round(posFair,2)};
   return{exit:false,cond:true};                                  // armed, waiting for persistence
 }
+
 /* --------------------- risk cage (E5) --------------------- */
 function makeCage(){
   return{
     day:null,realized:0,consecLosses:0,manualHalt:false,
     roll(){const d=new Date().toISOString().slice(0,10);if(d!==this.day){this.day=d;this.realized=0;this.consecLosses=0;}},
-    record(pnl){this.roll();this.realized+=pnl;if(pnl<0)this.consecLosses++;else if(pnl>0)this.consecLosses=0;},
+    record(pnl){this.roll();if(!Number.isFinite(pnl))return;this.realized+=pnl;if(pnl<0)this.consecLosses++;else if(pnl>0)this.consecLosses=0;}, // v3.9 F10: NaN guard — a single NaN would poison realized and silently kill the daily-loss halt forever
+    adjust(delta){this.roll();if(!Number.isFinite(delta))return;this.realized+=delta;},  // v3.6 F4 + v3.9 F10 NaN guard
     halted(){this.roll();
       if(this.manualHalt)return'manual halt';
       if(this.realized<=-Math.abs(CFG.DAILY_LOSS_LIMIT))return'daily loss limit';
@@ -732,41 +685,21 @@ function makeCage(){
   };
 }
 const cage=makeCage();
+
 /* --------------------- shadow book-keeping --------------------- */
 const STATE={pos:null,pendingMaker:null,lastReversal:null,cooldownUntil:0,fairStreak:0,fairStreakTicker:'',trades:[],reconcile:[],lastStatus:null,lastErr:null,ticks:0,lastSkipKey:'',skips:[],phantoms:[],revCondSince:0};
-let _logWrites=0;
-function logLine(obj){
-  try{
-    // periodic size guard: /tmp is small and this file is append-only; cap it so a long-lived
-    // instance can't fill the disk. /report reads STATE (in-memory), not this file, so truncation
-    // only drops the raw /log tail, never P&L.
-    if((++_logWrites % 500)===0){
-      try{ const st=fs.statSync(LOG_PATH); if(st.size>25*1024*1024) fs.truncateSync(LOG_PATH,0); }catch(_){}
-    }
-    fs.appendFileSync(LOG_PATH,JSON.stringify(obj)+'\n');
-  }catch(_){}
+function logLine(obj){try{fs.appendFileSync(LOG_PATH,JSON.stringify(obj)+'\n');}catch(_){}}
+function sizeQty(px,tauSec,inHV){ // v4.0 F11: EV-weighted sizing, pure for tests
+  let baseQty=CFG.CONTRACTS;
+  if(CFG.RISK_DOLLARS>0 && px>0.01)baseQty=Math.max(1,Math.round(CFG.RISK_DOLLARS/px));
+  if(CFG.JEWEL_MULT>0&&CFG.JEWEL_MULT!==1&&px>=CFG.JEWEL_PX_MIN&&tauSec>=CFG.JEWEL_TAU_MIN)
+    baseQty=Math.max(1,Math.round(baseQty*CFG.JEWEL_MULT));   // concentrate risk where the edge is
+  return inHV?Math.max(1,Math.floor(baseQty/2)):baseQty;
 }
 function openPos(mkt,side,mode,px,fair,tauSec){
   const _drift=round(tapeDrift(),4), _vol=round(tapeVolBps(),3);
-  let baseQty=CFG.CONTRACTS;
-  if(CFG.RISK_DOLLARS>0 && px>0.01){ // fixed-dollar-risk sizing: contracts so max loss ~= RISK_DOLLARS
-    baseQty=Math.max(1,Math.round(CFG.RISK_DOLLARS/px));
-  }
-  const qty=STATE.inHV?Math.max(1,Math.floor(baseQty/2)):baseQty;
-  // RADAR GATE: skip entry when spot flow opposes our side. Fail-open on null.
-  {
-    const _snap=radarSnapshot();
-    const _s=_snap.radarSpotImb;
-    if(_s!==null && _s!==undefined){
-      const _signed=(side==='YES')? _s : -_s;
-      if(_signed < CFG.RADAR_MIN_SPOTIMB){
-        logLine({ev:'SKIP',ticker:mkt.ticker,fair:round(fair,3),tauSec,
-          reason:'radar gate: spotImb '+_signed.toFixed(3)+' < '+CFG.RADAR_MIN_SPOTIMB,..._snap});
-        return;
-      }
-    }
-  }
-   const fees=mode==='taker'?takerFee(px,qty):makerFee(qty);
+  const qty=sizeQty(px,tauSec,!!STATE.inHV);
+  const fees=mode==='taker'?takerFee(px,qty):makerFee(qty);
   STATE.pos={ticker:mkt.ticker,strike:mkt.strike,closeTs:mkt.closeTs,side,mode,px,qty,fees,
     entryFair:side==='YES'?fair:1-fair,entryTs:Date.now(),entryTau:tauSec,session:sessionTag(ptClock()),entryDrift:_drift,entryVol:_vol,
     ...radarSnapshot()};
@@ -775,7 +708,19 @@ function openPos(mkt,side,mode,px,fair,tauSec){
   if(liveReady()){
     const cents=Math.round(px*100);
     const cnt=Math.min(qty,CFG.LIVE_MAX_CONTRACTS);
-    placeLiveOrder(mkt.ticker,side.toLowerCase(),cnt,cents).catch(e=>{
+    const posRef=STATE.pos;
+    placeLiveOrder(mkt.ticker,side.toLowerCase(),cnt,cents).then(r=>{
+      if(!CFG.LIVE||!r||r.dryRun||r.blocked)return;
+      const f=LIVE.lastFill&&LIVE.lastFill.ticker===mkt.ticker?LIVE.lastFill.filled:0;
+      // v3.5 TRUTH GUARD: if nothing filled, we hold NOTHING — drop the phantom position.
+      if(!f||f<=0){
+        if(STATE.pos===posRef){STATE.pos=null;STATE.revCondSince=0;}
+        logLine({ev:'POSITION_VOID',ticker:mkt.ticker,reason:'order filled 0 — no position held'});
+      } else if(STATE.pos===posRef && f<posRef.qty){
+        STATE.pos.qty=f;                       // partial fill: hold only what we got
+        logLine({ev:'POSITION_RESIZED',ticker:mkt.ticker,from:posRef.qty,to:f});
+      }
+    }).catch(e=>{
       LIVE.lastErr=String(e.message||e);logLine({ev:'LIVE_ERROR',err:LIVE.lastErr});});
   }
 }
@@ -784,10 +729,20 @@ function closePos(reason,exitPx,settled,won,extra){
   let pnl;
   if(settled){pnl=p.qty*((won?1:0)-p.px)-p.fees;}
   else{const fee=takerFee(exitPx,p.qty);pnl=p.qty*(exitPx-p.px)-p.fees-fee;}
+  // v3.6 F4b: near-strike settlements are coin flips our local metric gets wrong (5 corrections,
+  // -$22 late drag on 7/27). Book the LOSS case for RISK purposes until Kalshi reconcile confirms;
+  // the trade record keeps the best estimate, and reconcile adjusts risk by the true delta.
+  let riskPnl=pnl;
+  const nearStrike=settled&&extra&&extra.margin!=null&&Math.abs(extra.margin)<CFG.NEAR_STRIKE_USD;
+  if(nearStrike){riskPnl=-(p.qty*p.px)-p.fees;}
   const rec={ev:'CLOSE',ticker:p.ticker,side:p.side,mode:p.mode,entryPx:p.px,exitPx:settled?(won?1:0):exitPx,
     qty:p.qty,pnl:round(pnl,2),reason,settled:!!settled,entryFair:round(p.entryFair,3),
-    entryTau:p.entryTau,session:p.session||'unknown',ts:Date.now(),...(extra||{})};
-  STATE.trades.push(rec);cage.record(pnl);logLine(rec);
+    entryTau:p.entryTau,session:p.session||'unknown',ts:Date.now(),
+    ...(nearStrike?{riskProvisional:round(riskPnl,2)}:{}),...(extra||{})};
+  rec.riskBooked=round(riskPnl,2);
+  STATE.trades.push(rec);cage.record(riskPnl);
+  if(CFG.LIVE)liveRecord(riskPnl);            // v3.6 F4a: real money now feeds the live killswitch
+  logLine(rec);
   if(settled)STATE.reconcile.push({ticker:p.ticker,ourWin:won,side:p.side,checkedAt:0});
   else {STATE.lastReversal={ticker:p.ticker,side:p.side,ts:Date.now()};STATE.cooldownUntil=Date.now()+CFG.COOLDOWN_S*1000;
     // v2.3 PHANTOM TRACKING: keep watching the abandoned position; at window close, log what
@@ -797,10 +752,10 @@ function closePos(reason,exitPx,settled,won,extra){
     if(STATE.phantoms.length>50)STATE.phantoms.shift();}
   STATE.pos=null; STATE.revCondSince=0;
 }
+
 /* --------------------- main loop --------------------- */
 async function tick(){
   STATE.ticks++;
-  if(CFG.WS_ENABLED&&WebSocketLib&&!WS.sock&&liveReady())wsConnect();
   if(CFG.RADAR_URL&&STATE.ticks%3===0)pollRadar().catch(()=>{});   // v3.4: poll radar ~every 6s, fire-and-forget
   await pollSpot().catch(()=>{});
   ensureSentinel();
@@ -809,7 +764,7 @@ async function tick(){
   const nowMin=ptClock();
   const w=windowState(nowMin);STATE.inHV=w.inHV;
   const haltReason=cage.halted();
-  let mkt=null,book=null,fair=null,tauSec=null,decision={action:'NONE',reason:'idle'};
+  let mkt=null,book=null,fair=null,rawFair=null,tauSec=null,decision={action:'NONE',reason:'idle'};
   try{
     mkt=await discoverMarket(price);
     // settle any expired position FIRST — never depends on discovery succeeding
@@ -831,33 +786,13 @@ async function tick(){
     if(STATE.pos&&Date.now()>STATE.pos.closeTs){
       const avg=tapeAvg(STATE.pos.closeTs-60000,STATE.pos.closeTs);
       const lastPx=tapeLastAt(STATE.pos.closeTs);
-      const metric=(CFG.SETTLE_METRIC==='avg60')?avg:lastPx;   // v2.0: point-in-time by default (Kalshi-confirmed)
-      const proxyMargin=metric!==null?(metric-STATE.pos.strike):null;
-      // v4.4 KALSHI-TRUTH SETTLEMENT: near the strike the proxy is unreliable (source of every CORRECTION).
-      // Instead of booking a tape-guess and correcting 30s later, fetch Kalshi's official result and settle on it.
-      const nearStrike = proxyMargin!==null && Math.abs(proxyMargin)<CFG.KALSHI_SETTLE_BAND;
-      const waitedMs = Date.now()-STATE.pos.closeTs;
-      if(CFG.KALSHI_SETTLE && nearStrike && waitedMs<CFG.KALSHI_SETTLE_WAIT*1000 && !STATE.pos._kalshiPending){
-        // ask Kalshi once; settle when it answers. Do NOT book a proxy guess in the meantime.
-        STATE.pos._kalshiPending=true;
-        const posRef=STATE.pos;
-        fetchJson(KALSHI_BASE+'/markets/'+encodeURIComponent(posRef.ticker)).then(j=>{
-          const result=j&&j.market&&j.market.result;
-          if((result==='yes'||result==='no') && STATE.pos===posRef){
-            const won=posRef.side==='YES'?result==='yes':result==='no';
-            closePos('settlement (kalshi '+result+', near-strike '+round(proxyMargin,2)+')',null,true,won,
-              {settleAvg60:round(avg,2),settleLast:round(lastPx,2),settleUsed:'kalshi',kalshiResult:result,
-               margin:round(proxyMargin,2),strike:posRef.strike});
-          } else if(STATE.pos===posRef){ posRef._kalshiPending=false; } // not resolved yet; retry next tick
-        }).catch(()=>{ if(STATE.pos===posRef)posRef._kalshiPending=false; });
-      } else if(!STATE.pos._kalshiPending){
-        // clear of the strike (proxy reliable) OR Kalshi wait exceeded -> settle on the tape as before
-        const won=metric!==null?(STATE.pos.side==='YES'?metric>STATE.pos.strike:metric<=STATE.pos.strike):null;
-        const lbl=(CFG.KALSHI_SETTLE&&nearStrike)?'tape-fallback (kalshi timeout)':CFG.SETTLE_METRIC;
-        closePos('settlement ('+lbl+' '+round(metric,2)+')',null,true,!!won,
-          {settleAvg60:round(avg,2),settleLast:round(lastPx,2),settleUsed:lbl,
-           margin:proxyMargin!==null?round(proxyMargin,2):null,strike:STATE.pos.strike});
-      }
+      const metric=(CFG.SETTLE_METRIC==='avg60')?avg:lastPx;   // v3.6 F5: avg60 default — Kalshi settles on the 60s average (68/70 vs 65/70 on 7/27)
+      const fallback=(metric===null)?((CFG.SETTLE_METRIC==='avg60')?lastPx:avg):null;
+      const use=metric!==null?metric:fallback;
+      const won=use!==null?(STATE.pos.side==='YES'?use>STATE.pos.strike:use<=STATE.pos.strike):null;
+      closePos('settlement ('+CFG.SETTLE_METRIC+' '+round(use,2)+')',null,true,!!won,
+        {settleAvg60:round(avg,2),settleLast:round(lastPx,2),settleUsed:metric!==null?CFG.SETTLE_METRIC:'fallback',
+         margin:use!==null?round(use-STATE.pos.strike,2):null,strike:STATE.pos.strike});
     }
     if(STATE.lastReversal&&mkt&&STATE.lastReversal.ticker!==mkt.ticker)STATE.lastReversal=null;
     // cancel a resting shadow bid the moment its window rolls over
@@ -867,37 +802,19 @@ async function tick(){
     }
     if(mkt&&Number.isFinite(mkt.strike)){
       tauSec=(mkt.closeTs-Date.now())/1000;
-      // v4.0: prefer the live websocket book; fall back to REST if it's not healthy
-      if(CFG.WS_ENABLED){
-        if(WS.ticker!==mkt.ticker)wsSubscribe(mkt.ticker);
-        const wb=wsHealthy()?wsBookTouch():null;
-        book = wb && Number.isFinite(wb.yesAsk) && Number.isFinite(wb.noAsk)
-             ? wb : await getBook(mkt.ticker,mkt.quotes);
-      } else {
-        book=await getBook(mkt.ticker,mkt.quotes);
-      }
+      book=await getBook(mkt.ticker,mkt.quotes);
       const avgStart=mkt.closeTs-60000;
       const knownDur=clamp((Date.now()-avgStart)/1000,0,60);
       const knownAvg=knownDur>1?tapeAvg(avgStart,Date.now()):null;
       fair=computeFair({price,strike:mkt.strike,tauSec,volBps:tapeVolBps(),driftBps:tapeDrift(),knownAvg,knownDur});
-      const rawFair=fair;
-      if(CFG.CAL_ON&&fair!==null){ // v4.2: honest transform + honest ceiling — printed confidence never exceeds what the data supports
-        fair=Math.max(0.005,Math.min(CFG.CAL_CEIL,CFG.CAL_B*fair+CFG.CAL_A));
+      rawFair=fair;
+      if(CFG.CAL_ON&&fair!==null){ // v3.6 F1: SYMMETRIC calibration — shrinks confidence on BOTH sides, never inflates
+        fair=calFair(fair);
       }
       // maker fill check
       if(STATE.pendingMaker&&STATE.pendingMaker.ticker===mkt.ticker){
         const pm=STATE.pendingMaker;
-        const sd=pm.side||'YES', waited=(Date.now()-pm.ts)/1000;
-        const oppAsk=sd==='YES'?book.yesAsk:book.noAsk;
-        if(Number.isFinite(oppAsk)&&oppAsk<=pm.px){
-          STATE.pendingMaker=null;
-          logLine({ev:'MAKER_FILL',ticker:pm.ticker,side:sd,px:pm.px,takerWouldPay:pm.takerPx,saved:round((pm.takerPx||0)-pm.px,3),waitedS:round(waited,1)});
-          openPos(mkt,sd,'maker',pm.px,fair,tauSec);
-        } else if(waited>=CFG.MAKER_WAIT_S){
-          STATE.pendingMaker=null;
-          logLine({ev:'MAKER_TIMEOUT',ticker:pm.ticker,side:sd,restedAt:pm.px,waitedS:round(waited,1),fallbackTakerPx:oppAsk});
-          if(Number.isFinite(oppAsk)&&oppAsk>0.02&&oppAsk<0.98&&tauSec>CFG.MIN_TAU_ENTER)openPos(mkt,sd,'taker',oppAsk,fair,tauSec);
-        } else if(tauSec<8||Math.abs((fair??0)-pm.fairAtPost)>0.12){STATE.pendingMaker=null;logLine({ev:'MAKER_CANCEL',ticker:pm.ticker,why:'stale/fair moved'});}
+        if(tauSec<8||Math.abs((fair??0)-pm.fairAtPost)>0.12){STATE.pendingMaker=null;logLine({ev:'MAKER_CANCEL',ticker:pm.ticker,why:'stale/fair moved'});}
         else if(Number.isFinite(book.yesAsk)&&book.yesAsk<=pm.px){ // panic seller crossed into us
           STATE.pendingMaker=null;openPos(mkt,'YES','maker',pm.px,fair,tauSec);
         }
@@ -913,7 +830,13 @@ async function tick(){
         }
       }
       // entries
-      const gated=haltReason?('halted: '+haltReason):((!CFG.TRADE_ALL_HOURS&&!w.inPrime)?'outside prime window':(!sent.ok&&tauSec<180?'sentinel warming (late-window entries blocked)':null));
+      const sessNow=sessionTag(nowMin);
+      const liveHalt=CFG.LIVE?liveHalted():null;   // v3.6 F4a: live killswitch now gates ENTRIES, not just orders
+      const gated=haltReason?('halted: '+haltReason)
+        :(liveHalt?('live halted: '+liveHalt)
+        :(sessionSkipped(sessNow)?('session "'+sessNow+'" disabled (SKIP_SESSIONS='+CFG.SKIP_SESSIONS+')')
+        :((!CFG.TRADE_ALL_HOURS&&!w.inPrime)?'outside prime window'
+        :(!sent.ok&&tauSec<180?'sentinel warming (late-window entries blocked)':null))));
       if(!gated&&tauSec>0&&tauSec<=CFG.MAX_TAU_ENTER&&!STATE.pendingMaker){
         // v3.3 stability: count consecutive reads where THIS window's fair clears the band
         (function(){
@@ -922,7 +845,7 @@ async function tick(){
           if(mkt.ticker!==STATE.fairStreakTicker){STATE.fairStreakTicker=mkt.ticker;STATE.fairStreak=0;}
           STATE.fairStreak = clears ? STATE.fairStreak+1 : 0;
         })();
-        decision=decideEntry({fair,book,tauSec,fairStreak:STATE.fairStreak,inHV:w.inHV,sentPressure:sent.pressure||0,haveOpen:!!STATE.pos,ticker:mkt.ticker,lockout:STATE.lastReversal,cooldownUntil:STATE.cooldownUntil,driftBps:tapeDrift(),price,strike:mkt.strike,volBps:tapeVolBps()});
+        decision=decideEntry({fair,rawFair,book,tauSec,fairStreak:STATE.fairStreak,inHV:w.inHV,sentPressure:sent.pressure||0,haveOpen:!!STATE.pos,ticker:mkt.ticker,lockout:STATE.lastReversal,cooldownUntil:STATE.cooldownUntil,driftBps:tapeDrift(),price,strike:mkt.strike,volBps:tapeVolBps()});
         // v2.1: log a SKIP once per (window+reason) change — visibility without per-poll spam
         if(decision.action==='NONE'){
           const key=(mkt?mkt.ticker:'-')+'|'+decision.reason;
@@ -936,7 +859,7 @@ async function tick(){
         } else { STATE.lastSkipKey=''; }
         if(decision.action==='BUY_YES')openPos(mkt,'YES','taker',decision.px,fair,tauSec);
         else if(decision.action==='BUY_NO')openPos(mkt,'NO','taker',decision.px,fair,tauSec);
-        else if(decision.action==='POST_YES_BID'||decision.action==='POST_NO_BID'){const sd=decision.action==='POST_YES_BID'?'YES':'NO';STATE.pendingMaker={ticker:mkt.ticker,side:sd,px:decision.px,fairAtPost:fair,ts:Date.now(),takerPx:sd==='YES'?book.yesAsk:book.noAsk};logLine({ev:'MAKER_POST',ticker:mkt.ticker,side:sd,px:decision.px,takerWouldPay:sd==='YES'?book.yesAsk:book.noAsk,fair:round(fair,3)});}
+        else if(decision.action==='POST_YES_BID'){STATE.pendingMaker={ticker:mkt.ticker,px:decision.px,fairAtPost:fair,ts:Date.now()};logLine({ev:'MAKER_POST',ticker:mkt.ticker,px:decision.px,fair:round(fair,3)});}
       }else if(gated){decision={action:'NONE',reason:gated};}
     }
     STATE.lastErr=null;
@@ -953,9 +876,23 @@ async function tick(){
         let rec=null;
         for(let i=STATE.trades.length-1;i>=0;i--){if(STATE.trades[i].ticker===rc.ticker&&STATE.trades[i].settled){rec=STATE.trades[i];break;}}
         if(rec){rec.kalshiResult=result;
-          if(!match){const np=truthPnl(rec,actualWin);
+          const np=truthPnl(rec,actualWin);
+          // v3.6 F4: settle risk accounting against Kalshi truth EVERY time — this releases the
+          // near-strike provisional loss on confirmed wins and books the real loss on flips.
+          const booked=(rec.riskBooked!==undefined&&rec.riskBooked!==null)?rec.riskBooked:rec.pnl;
+          const delta=Math.round((np-booked)*100)/100;
+          if(delta!==0){
+            cage.adjust(delta);
+            if(CFG.LIVE)liveRecord(delta);
+            logLine({ev:'RISK_ADJUST',ticker:rc.ticker,booked,truth:np,delta,
+              cageRealized:round(cage.realized,2),liveRealized:round(LIVE.realizedToday,2)});
+          }
+          rec.riskBooked=np;
+          if(!match){
             logLine({ev:'CORRECTION',ticker:rc.ticker,oldPnl:rec.pnl,newPnl:np,margin:rec.margin??null});
-            rec.pnlOriginal=rec.pnl;rec.pnl=np;rec.corrected=true;}}
+            rec.pnlOriginal=rec.pnl;rec.pnl=np;rec.corrected=true;
+          } else if(rec.pnl!==np){ rec.pnl=np; }   // reconcile also trues-up provisional records on matches
+        }
         STATE.reconcile=STATE.reconcile.filter(x=>x!==rc);
       }
     }).catch(()=>{});
@@ -964,16 +901,20 @@ async function tick(){
     recentSkips:STATE.skips.slice(-5),
     discovery:{...DISC},
     book,fair:fair===null?null:round(fair,3),sentinel:{ok:sent.ok,pressure:sent.pressure||0,venue:sent.venue||null},
-    volBps:round(tapeVolBps(),3),driftBps:round(tapeDrift(),4),rawFair:typeof rawFair!=='undefined'?round(rawFair,4):null,
-    window:{inPrime:w.inPrime,inHV:w.inHV},halt:haltReason,decision,
+    volBps:round(tapeVolBps(),3),driftBps:round(tapeDrift(),4),rawFair:rawFair===null?null:round(rawFair,4),
+    window:{inPrime:w.inPrime,inHV:w.inHV},halt:haltReason,liveHalt:CFG.LIVE?liveHalted():null,decision,
+    session:sessionTag(nowMin),skipSessions:CFG.SKIP_SESSIONS,
+    riskToday:{cage:round(cage.realized,2),live:round(LIVE.realizedToday,2)},
     position:STATE.pos?{ticker:STATE.pos.ticker,side:STATE.pos.side,px:STATE.pos.px,qty:STATE.pos.qty,mode:STATE.pos.mode}:null,
     pendingMaker:STATE.pendingMaker?{px:STATE.pendingMaker.px}:null,
     tapeErr:lastTapeErr,err:STATE.lastErr};
 }
+
 function truthPnl(rec,actualWin){ // recompute a settled trade's P&L from Kalshi's official result
   const fee=rec.mode==='taker'?takerFee(rec.entryPx,rec.qty):CFG.MAKER_FEE*rec.qty;
   return Math.round((rec.qty*((actualWin?1:0)-rec.entryPx)-fee)*100)/100;
 }
+
 /* --------------------- reporting --------------------- */
 function report(){
   const t=STATE.trades;
@@ -985,12 +926,14 @@ function report(){
   const bySession={};
   for(const x of t){const s=x.session||'unknown';bySession[s]=bySession[s]||{n:0,wins:0,pnl:0};
     bySession[s].n++;if(x.pnl>0)bySession[s].wins++;bySession[s].pnl=round(bySession[s].pnl+x.pnl,2);}
-  return{version:VERSION,mode:'24/7'+(CFG.TRADE_ALL_HOURS?'':' (PRIME_ONLY)'),
+  return{version:VERSION,mode:'24/7'+(CFG.TRADE_ALL_HOURS?'':' (PRIME_ONLY)')+(CFG.SKIP_SESSIONS?(' minus ['+CFG.SKIP_SESSIONS+']'):''),
     trades:n,wins,winRate:n?round(wins/n,3):null,totalPnl:round(pnl,2),
     avgPnlPerTrade:n?round(pnl/n,2):null,settled:settledN,reversalExits:n-settledN,corrections:t.filter(x=>x.corrected).length,
-    byMode,bySession,todayRealized:round(cage.realized,2),consecLosses:cage.consecLosses,halt:cage.halted(),
+    byMode,bySession,todayRealized:round(cage.realized,2),liveRealizedToday:round(LIVE.realizedToday,2),
+    consecLosses:cage.consecLosses,halt:cage.halted(),liveHalt:CFG.LIVE?liveHalted():null,
     last10:t.slice(-10)};
 }
+
 /* --------------------- self-test (pure, offline) --------------------- */
 function runSelfTest(){
   const C=[];
@@ -1019,7 +962,7 @@ function runSelfTest(){
   C.push({name:'perp pressure down vetoes YES buy',pass:d4.action==='NONE',got:d4.action});
   // 9: panic-capture maker bid posted late-window
   const d5=decideEntry({fair:0.62,book:{yesAsk:0.6,noAsk:0.5,yesBid:0.42,noBid:0.4},tauSec:120,inHV:false,sentPressure:0,haveOpen:false});
-  C.push({name:'v4.5 late-window panic-capture at fair 0.62: bid 0.54 sub-floor -> correctly NOT posted',pass:d5.action==='NONE',got:d5.action+' @'+(d5.px||'-')});
+  C.push({name:'late window → panic-capture bid below fair',pass:d5.action==='POST_YES_BID'&&d5.px<0.62,got:d5.action+' @'+d5.px});
   // 10: reversal exit needs BOTH adverse perp AND fair collapse
   const posA={side:'YES',entryFair:0.9};
   const eA=decideExit({pos:posA,fair:0.6,sentPressure:-45,tauSec:200,condSince:Date.now()-15000}); // persisted 15s
@@ -1050,35 +993,183 @@ function runSelfTest(){
   C.push({name:'normalizeBook parses fp-dollars and legacy-cents',pass:!!(okA&&okB),got:JSON.stringify(nbA&&nbA.yes)});
   // 16: v2.0 FILTER — high-confidence favorite (fair 0.92) is UNTOUCHED, still trades
   const f_hi=decideEntry({fair:0.92,book:{yesAsk:0.84,noAsk:0.14,yesBid:0.8,noBid:0.1},tauSec:400,inHV:false,sentPressure:0,haveOpen:false});
-  C.push({name:'v2 filter PASSES fair>=0.85 favorite (0.9+ untouched)',pass:/BUY_YES|POST_YES_BID/.test(f_hi.action),got:f_hi.action});
+  C.push({name:'v2 filter PASSES fair>=0.85 favorite (0.9+ untouched)',pass:f_hi.action==='BUY_YES',got:f_hi.action});
   // 17: v2.0 FILTER — mushy middle (fair 0.68) is REJECTED
-  const f_mid=decideEntry({fair:0.68,book:{yesAsk:0.55,noAsk:0.42,yesBid:0.5,noBid:0.4},tauSec:400,inHV:false,sentPressure:0,haveOpen:false});
-  C.push({name:'v2 filter REJECTS mid-band 0.30-0.85',pass:f_mid.action==='NONE',got:f_mid.action+' '+f_mid.reason});
+  const f_mid=decideEntry({fair:0.84,book:{yesAsk:0.76,noAsk:0.30,yesBid:0.74,noBid:0.28},tauSec:400,inHV:false,sentPressure:0,haveOpen:false});
+  C.push({name:'v2 filter REJECTS mid-band 0.30-0.85',pass:f_mid.action==='NONE'&&/trade band/.test(f_mid.reason),got:f_mid.action+' '+f_mid.reason});
   // 18: v2.3 — longshots STRIPPED. Gate data: <=0.30 band won 1/8 vs 1.7 predicted. Must now be REJECTED.
   const f_lo=decideEntry({fair:0.18,book:{yesAsk:0.07,noAsk:0.9,yesBid:0.05,noBid:0.88},tauSec:400,inHV:false,sentPressure:0,haveOpen:false});
   C.push({name:'v2.3 filter REJECTS longshots (stripped)',pass:f_lo.action==='NONE',got:f_lo.action+' '+f_lo.reason});
+  // 22: v3.5 marketable pricing — both sides must cross, not sit at the touch
+  (function(){
+    const mk=(side,cents)=>{const isYes=side==='yes';
+      return isYes?Math.min(0.99,(cents/100)+0.01):Math.max(0.01,(1-cents/100)-0.01);};
+    C.push({name:'v3.5 YES bid crosses up (77c -> 0.78)',pass:Math.abs(mk('yes',77)-0.78)<1e-9,got:mk('yes',77).toFixed(4)});
+    C.push({name:'v3.5 NO ask crosses down (64c -> 0.35 not 0.36)',pass:Math.abs(mk('no',64)-0.35)<1e-9,got:mk('no',64).toFixed(4)});
+    C.push({name:'v3.5 pricing stays in bounds',pass:mk('yes',99)<=0.99&&mk('no',1)>=0.01,got:'ok'});
+  })();
   // 20: v3.3 REAL-CUSHION GATE — blocks drift-manufactured confidence
   // Reproduce the actual bad trade: price $7 from strike, tau 427, vol 0.286 -> 0.18 sigma real cushion.
-  const badTrade=decideEntry({fair:0.973,book:{yesAsk:0.66,noAsk:0.33,yesBid:0.64,noBid:0.31},
-    tauSec:427,inHV:false,sentPressure:0,haveOpen:false,driftBps:-0.1255,
+  const badTrade=decideEntry({fair:0.973,book:{yesAsk:0.80,noAsk:0.19,yesBid:0.78,noBid:0.17},
+    tauSec:427,inHV:false,sentPressure:0,haveOpen:false,driftBps:-0.015,
     price:65711,strike:65718.69,volBps:0.286,fairStreak:99});
   C.push({name:'v3.3 BLOCKS the real bad trade (0.18 sigma, "0.973" fair)',
-    pass:badTrade.action==='NONE'&&/(real cushion|drift sign gate)/.test(badTrade.reason),got:badTrade.action+' '+(badTrade.reason||'')});
+    pass:badTrade.action==='NONE'&&/real cushion/.test(badTrade.reason),got:badTrade.action+' '+(badTrade.reason||'')});
   // a genuinely cushioned favorite still trades: price $150 above strike, tau 400, vol 0.3 -> ~1.9 sigma
   const goodTrade=decideEntry({fair:0.92,book:{yesAsk:0.80,noAsk:0.12,yesBid:0.78,noBid:0.10},
     tauSec:400,inHV:false,sentPressure:0,haveOpen:false,driftBps:0.02,
     price:66150,strike:66000,volBps:0.3,fairStreak:99});
-  C.push({name:'v3.3 ALLOWS genuinely cushioned favorite (~1.9 sigma)',pass:/BUY_YES|POST_YES_BID/.test(goodTrade.action),got:goodTrade.action+' '+(goodTrade.reason||'')});
+  C.push({name:'v3.3 ALLOWS genuinely cushioned favorite (~1.9 sigma)',pass:goodTrade.action==='BUY_YES',got:goodTrade.action+' '+(goodTrade.reason||'')});
   // NO side: price BELOW strike by 1.9 sigma -> NO allowed
   const goodNo=decideEntry({fair:0.08,book:{yesAsk:0.90,noAsk:0.80,yesBid:0.88,noBid:0.78},
     tauSec:400,inHV:false,sentPressure:0,haveOpen:false,driftBps:-0.02,
     price:65850,strike:66000,volBps:0.3,fairStreak:99});
-  C.push({name:'v3.3 ALLOWS cushioned NO (price below strike)',pass:/BUY_NO|POST_NO_BID/.test(goodNo.action),got:goodNo.action+' '+(goodNo.reason||'')});
+  C.push({name:'v3.3 ALLOWS cushioned NO (price below strike)',pass:goodNo.action==='BUY_NO',got:goodNo.action+' '+(goodNo.reason||'')});
   // 21: v3.3 STABILITY — single noisy touch is rejected
   const flicker=decideEntry({fair:0.92,book:{yesAsk:0.80,noAsk:0.12,yesBid:0.78,noBid:0.10},
     tauSec:400,inHV:false,sentPressure:0,haveOpen:false,driftBps:0.02,
     price:66150,strike:66000,volBps:0.3,fairStreak:1});
   C.push({name:'v3.3 REJECTS single-read flicker (1/3 streak)',pass:flicker.action==='NONE'&&/not stable/.test(flicker.reason),got:flicker.action+' '+(flicker.reason||'')});
+  /* ---------------- v3.6 checks ---------------- */
+  // F1 symmetric calibration: low side is SHRUNK toward 0.5, never inflated
+  C.push({name:'v3.6 sym cal: fair 0.10 -> ~0.142 (mirror of 0.90 shrink)',pass:Math.abs(calFair(0.10)-0.1424)<0.01,got:calFair(0.10).toFixed(4)});
+  C.push({name:'v3.6 sym cal: raw 0.17 no longer floors to 0.005 (old bug)',pass:calFair(0.17)>0.2,got:calFair(0.17).toFixed(4)});
+  C.push({name:'v3.6 sym cal: NO-side conf max is cal(0.995)=0.970, never 0.995',pass:Math.abs((1-calFair(0.005))-calFair(0.995))<1e-9&&calFair(0.995)<0.98,got:(1-calFair(0.005)).toFixed(4)});
+  C.push({name:'v3.6 sym cal is symmetric: calFair(f)=1-calFair(1-f)',pass:Math.abs(calFair(0.3)-(1-calFair(0.7)))<1e-9,got:calFair(0.3).toFixed(4)+'/'+(1-calFair(0.7)).toFixed(4)});
+  C.push({name:'v3.6 sym cal high side unchanged: 0.90 -> ~0.858',pass:Math.abs(calFair(0.90)-0.858)<0.01,got:calFair(0.90).toFixed(3)});
+  // F2 saturation gate: pinned raw fair rejects the normal taker path
+  const satY=decideEntry({fair:0.97,rawFair:0.995,book:{yesAsk:0.84,noAsk:0.14,yesBid:0.80,noBid:0.10},
+    tauSec:400,inHV:false,sentPressure:0,haveOpen:false,driftBps:0.02,
+    price:66300,strike:66000,volBps:0.3,fairStreak:99});
+  C.push({name:'v3.7 SAT gate REMOVED: pinned YES with good px/vol now trades',pass:satY.action==='BUY_YES',got:satY.action+' '+(satY.reason||'')});
+  const satN=decideEntry({fair:0.03,rawFair:0.005,book:{yesAsk:0.95,noAsk:0.80,yesBid:0.90,noBid:0.75},
+    tauSec:400,inHV:false,sentPressure:0,haveOpen:false,driftBps:-0.02,
+    price:65700,strike:66000,volBps:0.3,fairStreak:99});
+  C.push({name:'v3.7 SAT gate REMOVED: pinned NO with good px/vol now trades',pass:satN.action==='BUY_NO',got:satN.action+' '+(satN.reason||'')});
+  const unsat=decideEntry({fair:0.92,rawFair:0.94,book:{yesAsk:0.80,noAsk:0.12,yesBid:0.78,noBid:0.10},
+    tauSec:400,inHV:false,sentPressure:0,haveOpen:false,driftBps:0.02,
+    price:66150,strike:66000,volBps:0.3,fairStreak:99});
+  C.push({name:'v3.6 SAT gate passes unpinned raw fair (0.94)',pass:unsat.action==='BUY_YES',got:unsat.action+' '+(unsat.reason||'')});
+  // F3 entry price cap
+  const capY=decideEntry({fair:0.97,rawFair:0.97,book:{yesAsk:0.90,noAsk:0.05,yesBid:0.88,noBid:0.03},
+    tauSec:400,inHV:false,sentPressure:0,haveOpen:false,driftBps:0.02,
+    price:66300,strike:66000,volBps:0.3,fairStreak:99});
+  C.push({name:'v3.7 px band blocks YES ask 0.90 (>0.85)',pass:capY.action==='NONE'&&/edge band/.test(capY.reason),got:capY.action+' '+(capY.reason||'')});
+  const capN=decideEntry({fair:0.03,rawFair:0.03,book:{yesAsk:0.98,noAsk:0.90,yesBid:0.95,noBid:0.88},
+    tauSec:400,inHV:false,sentPressure:0,haveOpen:false,driftBps:-0.02,
+    price:65700,strike:66000,volBps:0.3,fairStreak:99});
+  C.push({name:'v3.7 px band blocks NO ask 0.90 (>0.85)',pass:capN.action==='NONE'&&/edge band/.test(capN.reason),got:capN.action+' '+(capN.reason||'')});
+  C.push({name:'v3.7 px band passes 0.84 (test 5 regression)',pass:d1.action==='BUY_YES',got:d1.action});
+  const cheap=decideEntry({fair:0.92,rawFair:0.94,book:{yesAsk:0.70,noAsk:0.22,yesBid:0.68,noBid:0.20},
+    tauSec:400,inHV:false,sentPressure:0,haveOpen:false,driftBps:0.02,
+    price:66150,strike:66000,volBps:0.3,fairStreak:99});
+  C.push({name:'v3.7 px band BLOCKS cheap 0.70 (px<0.76: -$12.24 over 159 trades)',pass:cheap.action==='NONE'&&/edge band/.test(cheap.reason),got:cheap.action+' '+(cheap.reason||'')});
+  // F4 risk accounting: cage.adjust exists and moves the killswitch
+  (function(){
+    const cg3=makeCage(); cg3.record(-10); cg3.adjust(-15);
+    C.push({name:'v3.6 cage.adjust flows reconcile deltas into daily realized',pass:Math.abs(cg3.realized-(-25))<1e-9,got:String(cg3.realized)});
+    const cg4=makeCage(); cg4.record(-10); cg4.adjust(-((CFG.DAILY_LOSS_LIMIT)));
+    C.push({name:'v3.6 adjusted losses can trip the daily limit',pass:cg4.halted()==='daily loss limit',got:String(cg4.halted())});
+  })();
+  // F4a liveRecord actually moves LIVE.realizedToday (was dead code pre-3.6)
+  (function(){
+    const save=LIVE.realizedToday, saveDay=LIVE.day, saveH=LIVE.halted;
+    LIVE.day=new Date().toISOString().slice(0,10); LIVE.realizedToday=0; LIVE.halted=null;
+    liveRecord(-7.5); liveRecord(2.5);
+    const got=LIVE.realizedToday;
+    LIVE.realizedToday=save; LIVE.day=saveDay; LIVE.halted=saveH;
+    C.push({name:'v3.6 liveRecord writes LIVE.realizedToday (killswitch un-deadened)',pass:Math.abs(got-(-5))<1e-9,got:String(got)});
+  })();
+  // F4b near-strike provisional math: risk books the loss case, truth releases it
+  (function(){
+    // NO @0.74 x7, fees 0.094 — the 7/27 shape. Provisional = -(0.74*7)-0.094 = -5.27
+    const prov=-(7*0.74)-0.094;
+    C.push({name:'v3.6 near-strike provisional books worst case (-5.27)',pass:Math.abs(prov-(-5.274))<0.01,got:prov.toFixed(2)});
+    const win=truthPnl({mode:'taker',entryPx:0.74,qty:7},true);   // Kalshi confirms win: +1.73
+    const delta=Math.round((win-prov)*100)/100;                    // released back on reconcile
+    C.push({name:'v3.6 reconcile releases provisional on confirmed win (+~7.00)',pass:Math.abs(delta-7.00)<0.05,got:String(delta)});
+  })();
+  // F5 settlement basis default
+  C.push({name:'v3.6 SETTLE_METRIC defaults to avg60 (68/70 vs last 65/70 on 7/27)',
+    pass:process.env.SETTLE_METRIC?true:CFG.SETTLE_METRIC==='avg60',got:CFG.SETTLE_METRIC+(process.env.SETTLE_METRIC?' (env override)':'')});
+  // F6 session skip
+  C.push({name:'v3.6 midday skipped by default',pass:sessionSkipped('midday')===true,got:CFG.SKIP_SESSIONS});
+  C.push({name:'v3.6 other sessions not skipped',pass:!sessionSkipped('prime')&&!sessionSkipped('overnight')&&!sessionSkipped('evening'),got:CFG.SKIP_SESSIONS});
+  // F7 vol-regime gate (v3.6.1)
+  const volIn=decideEntry({fair:0.92,rawFair:0.94,book:{yesAsk:0.80,noAsk:0.12,yesBid:0.78,noBid:0.10},
+    tauSec:400,inHV:false,sentPressure:0,haveOpen:false,driftBps:0.02,
+    price:66300,strike:66000,volBps:0.36,fairStreak:99});
+  C.push({name:'v3.7 vol gate BLOCKS pain band A (0.36 in [0.35,0.38))',pass:volIn.action==='NONE'&&/vol regime/.test(volIn.reason),got:volIn.action+' '+(volIn.reason||'')});
+  const volB=decideEntry({fair:0.92,rawFair:0.94,book:{yesAsk:0.80,noAsk:0.12,yesBid:0.78,noBid:0.10},
+    tauSec:400,inHV:false,sentPressure:0,haveOpen:false,driftBps:0.02,
+    price:66300,strike:66000,volBps:0.55,fairStreak:99});
+  C.push({name:'v3.7 vol gate BLOCKS pain band B (0.55 in [0.50,0.60))',pass:volB.action==='NONE'&&/vol regime/.test(volB.reason),got:volB.action+' '+(volB.reason||'')});
+  const volMid=decideEntry({fair:0.92,rawFair:0.94,book:{yesAsk:0.80,noAsk:0.12,yesBid:0.78,noBid:0.10},
+    tauSec:400,inHV:false,sentPressure:0,haveOpen:false,driftBps:0.02,
+    price:66300,strike:66000,volBps:0.45,fairStreak:99});
+  C.push({name:'v3.7 vol gate PASSES the gap (0.45 between the two pain bands)',pass:volMid.action==='BUY_YES',got:volMid.action+' '+(volMid.reason||'')});
+  const volLo=decideEntry({fair:0.92,rawFair:0.94,book:{yesAsk:0.80,noAsk:0.12,yesBid:0.78,noBid:0.10},
+    tauSec:400,inHV:false,sentPressure:0,haveOpen:false,driftBps:0.02,
+    price:66150,strike:66000,volBps:0.3,fairStreak:99});
+  C.push({name:'v3.6.1 vol gate PASSES calm tape (0.30)',pass:volLo.action==='BUY_YES',got:volLo.action+' '+(volLo.reason||'')});
+  const volHi=decideEntry({fair:0.92,rawFair:0.94,book:{yesAsk:0.80,noAsk:0.12,yesBid:0.78,noBid:0.10},
+    tauSec:400,inHV:false,sentPressure:0,haveOpen:false,driftBps:0.02,
+    price:66700,strike:66000,volBps:0.65,fairStreak:99});
+  C.push({name:'v3.6.1 vol gate PASSES hot trending tape (0.65)',pass:volHi.action==='BUY_YES',got:volHi.action+' '+(volHi.reason||'')});
+  const volTail=decideEntry({fair:0.97,rawFair:0.97,book:{yesAsk:0.93,noAsk:0.08,yesBid:0.92,noBid:0.06},
+    tauSec:30,inHV:false,sentPressure:0,haveOpen:false,driftBps:0,
+    price:66300,strike:66000,volBps:0.45});
+  C.push({name:'v3.6.1 tail-snipe EXEMPT from vol gate (sigma hurdle self-scales)',pass:volTail.action==='BUY_YES'&&/tail-snipe/.test(volTail.reason),got:volTail.action+' '+(volTail.reason||'')});
+  // F9 drift-opposition gate (v3.9)
+  const doY=decideEntry({fair:0.92,rawFair:0.94,book:{yesAsk:0.80,noAsk:0.12,yesBid:0.78,noBid:0.10},
+    tauSec:400,inHV:false,sentPressure:0,haveOpen:false,driftBps:-0.05,
+    price:66150,strike:66000,volBps:0.3,fairStreak:99});
+  C.push({name:'v3.9 F9 BLOCKS YES vs opposing drift (-0.05)',pass:doY.action==='NONE'&&/opposes drift/.test(doY.reason),got:doY.action+' '+(doY.reason||'')});
+  const doN=decideEntry({fair:0.08,rawFair:0.06,book:{yesAsk:0.95,noAsk:0.80,yesBid:0.93,noBid:0.78},
+    tauSec:400,inHV:false,sentPressure:0,haveOpen:false,driftBps:0.05,
+    price:65850,strike:66000,volBps:0.3,fairStreak:99});
+  C.push({name:'v3.9 F9 BLOCKS NO vs opposing drift (+0.05)',pass:doN.action==='NONE'&&/opposes drift/.test(doN.reason),got:doN.action+' '+(doN.reason||'')});
+  const doDead=decideEntry({fair:0.92,rawFair:0.94,book:{yesAsk:0.80,noAsk:0.12,yesBid:0.78,noBid:0.10},
+    tauSec:400,inHV:false,sentPressure:0,haveOpen:false,driftBps:-0.01,
+    price:66150,strike:66000,volBps:0.3,fairStreak:99});
+  C.push({name:'v3.9 F9 deadband: tiny opposing drift (-0.01) still trades',pass:doDead.action==='BUY_YES',got:doDead.action+' '+(doDead.reason||'')});
+  const doWith=decideEntry({fair:0.92,rawFair:0.94,book:{yesAsk:0.80,noAsk:0.12,yesBid:0.78,noBid:0.10},
+    tauSec:400,inHV:false,sentPressure:0,haveOpen:false,driftBps:0.05,
+    price:66150,strike:66000,volBps:0.3,fairStreak:99});
+  C.push({name:'v3.9 F9 WITH-drift trades normally (+0.05 YES)',pass:doWith.action==='BUY_YES',got:doWith.action+' '+(doWith.reason||'')});
+  const doTail=decideEntry({fair:0.97,rawFair:0.97,book:{yesAsk:0.93,noAsk:0.08,yesBid:0.92,noBid:0.06},
+    tauSec:30,inHV:false,sentPressure:0,haveOpen:false,driftBps:-0.10,
+    price:66300,strike:66000,volBps:0.5});
+  C.push({name:'v3.9 tail-snipe EXEMPT from F9 (fires before it)',pass:doTail.action==='BUY_YES'&&/tail-snipe/.test(doTail.reason),got:doTail.action+' '+(doTail.reason||'')});
+  // F10 NaN hardening (v3.9): a poisoned pnl must not disable the killswitch
+  (function(){
+    const cgN=makeCage(); cgN.record(NaN); cgN.record(-30); cgN.record(NaN); cgN.adjust(NaN); cgN.record(-30); cgN.record(-30); cgN.record(-30);
+    C.push({name:'v3.9 F10 cage survives NaN poisoning (realized stays finite, halts work)',pass:Number.isFinite(cgN.realized)&&cgN.realized===-120&&cgN.halted()!==null,got:'realized='+cgN.realized+' halt='+cgN.halted()});
+    const save=LIVE.realizedToday, sd=LIVE.day, sh=LIVE.halted;
+    LIVE.day=new Date().toISOString().slice(0,10); LIVE.realizedToday=0; LIVE.halted=null;
+    liveRecord(NaN); liveRecord(-7);
+    const ok=Number.isFinite(LIVE.realizedToday)&&LIVE.realizedToday===-7;
+    LIVE.realizedToday=save; LIVE.day=sd; LIVE.halted=sh;
+    C.push({name:'v3.9 F10 liveRecord survives NaN (live killswitch stays alive)',pass:ok,got:String(ok)});
+  })();
+  // F11 EV-weighted sizing (v4.0)
+  (function(){
+    const sM=CFG.JEWEL_MULT,sP=CFG.JEWEL_PX_MIN,sT=CFG.JEWEL_TAU_MIN,sR=CFG.RISK_DOLLARS;
+    CFG.RISK_DOLLARS=5;CFG.JEWEL_MULT=1.5;CFG.JEWEL_PX_MIN=0.80;CFG.JEWEL_TAU_MIN=450;
+    const q1=sizeQty(0.82,500,false); // jewel: round(5/0.82)=6 -> x1.5 -> 9
+    C.push({name:'v4.0 F11 jewel cell sized up (px.82 tau500 -> 9 not 6)',pass:q1===9,got:String(q1)});
+    const q2=sizeQty(0.78,500,false); // not jewel (px<0.80): round(5/0.78)=6
+    C.push({name:'v4.0 F11 non-jewel px keeps base size (6)',pass:q2===6,got:String(q2)});
+    const q3=sizeQty(0.82,300,false); // not jewel (tau<450)
+    C.push({name:'v4.0 F11 non-jewel tau keeps base size (6)',pass:q3===6,got:String(q3)});
+    CFG.JEWEL_MULT=1.0;
+    const q4=sizeQty(0.82,500,false);
+    C.push({name:'v4.0 F11 MULT=1.0 disables sizing (6)',pass:q4===6,got:String(q4)});
+    CFG.JEWEL_MULT=1.5;
+    const q5=sizeQty(0.82,500,true); // HV halves after mult: floor(9/2)=4
+    C.push({name:'v4.0 F11 HV halving still applies (jewel+HV -> 4)',pass:q5===4,got:String(q5)});
+    CFG.JEWEL_MULT=sM;CFG.JEWEL_PX_MIN=sP;CFG.JEWEL_TAU_MIN=sT;CFG.RISK_DOLLARS=sR;
+  })();
   // 19: v3.0 LIVE LAYER — safety-critical checks
   C.push({name:'v3.0 defaults to DRY RUN (LIVE off unless explicitly armed)',pass:CFG.LIVE===false,got:'LIVE='+CFG.LIVE});
   C.push({name:'v3.0 live inactive without credentials',pass:(!CFG.KALSHI_KEY_ID||!CFG.KALSHI_PRIVATE_KEY)?liveReady()===false:liveReady()===true,got:'configured='+liveReady()});
@@ -1113,42 +1204,12 @@ function runSelfTest(){
     pass:(!CFG.KALSHI_PRIVATE_KEY)?true:(function(){try{const h=signRequest('GET','/trade-api/v2/portfolio/balance');
       return !!(h['KALSHI-ACCESS-KEY']&&h['KALSHI-ACCESS-TIMESTAMP']&&h['KALSHI-ACCESS-SIGNATURE']);}catch(e){return false;}})(),
     got:CFG.KALSHI_PRIVATE_KEY?'signed':'no key in test env (skipped)'});
-  // 18f: v4.3 TRUE SIGMA — overconfidence fixed inside the model, cal is identity
-  C.push({name:'v4.3 cal defaults to identity (band-aid retired)',pass:CFG.CAL_B===1&&CFG.CAL_A===0,got:CFG.CAL_B+'/'+CFG.CAL_A});
-  C.push({name:'v4.3 VOL_SCALE active (default 1.3)',pass:CFG.VOL_SCALE>=1.2&&CFG.VOL_SCALE<=1.5,got:String(CFG.VOL_SCALE)});
-  // moderate cushion must print MODERATE confidence: $100 cushion, vol .5, tau 300 -> ~0.92, NOT the old 0.97
-  const hf=computeFair({price:66100,strike:66000,tauSec:300,volBps:0.5,driftBps:0,knownAvg:null,knownDur:0});
-  C.push({name:'v4.3 honest: $100/0.5vol/300s cushion prints ~0.92 (old model faked 0.97)',pass:hf>0.90&&hf<0.945,got:String(Math.round(hf*1000)/1000)});
-  // deep cushion still EARNS high confidence: $250 same conditions -> 0.99+ and that is genuinely near-locked
-  const hf2=computeFair({price:66250,strike:66000,tauSec:300,volBps:0.5,driftBps:0,knownAvg:null,knownDur:0});
-  C.push({name:'v4.3 deep cushion still earns 0.99 (high scores exist, must be earned)',pass:hf2>0.98,got:String(Math.round(hf2*1000)/1000)});
-  // 24: v4.0 WEBSOCKET BOOK — correctness of the local book reconstruction
-  (function(){
-    WS.book.yes.clear(); WS.book.no.clear();
-    wsApplySnapshot({yes_dollars_fp:[['0.4700','300.00'],['0.4600','150.00']], no_dollars_fp:[['0.5300','200.00'],['0.5400','100.00']]});
-    const t1=wsBookTouch();
-    C.push({name:'v4.0 snapshot -> best yes bid 0.47',pass:Math.abs(t1.yesBid-0.47)<1e-6,got:String(t1.yesBid)});
-    C.push({name:'v4.0 implied yesAsk = 1 - best no bid (0.46)',pass:Math.abs(t1.yesAsk-0.46)<1e-6,got:String(t1.yesAsk)});
-    wsApplyDelta({side:'yes',price_dollars:'0.4800',delta_fp:'100.00'});
-    C.push({name:'v4.0 delta adds a new level (yes bid -> 0.48)',pass:Math.abs(wsBookTouch().yesBid-0.48)<1e-6,got:String(wsBookTouch().yesBid)});
-    wsApplyDelta({side:'yes',price_dollars:'0.4800',delta_fp:'-100.00'});
-    C.push({name:'v4.0 delta removes exhausted level (back to 0.47)',pass:Math.abs(wsBookTouch().yesBid-0.47)<1e-6,got:String(wsBookTouch().yesBid)});
-    wsApplySnapshot({yes_dollars_fp:[['0.9010','100.00'],['0.9030','200.00']], no_dollars_fp:[['0.0280','50.00']]});
-    C.push({name:'v4.0 sub-cent prices kept distinct (0.9030 top, not merged to 0.90)',pass:Math.abs(wsBookTouch().yesBid-0.9030)<1e-6,got:String(wsBookTouch().yesBid)});
-    C.push({name:'v4.0 sub-cent book has 2 yes levels not 1',pass:WS.book.yes.size===2,got:String(WS.book.yes.size)});
-    WS.book.yes.clear(); WS.book.no.clear();
-    C.push({name:'v4.0.1 empty book is NOT healthy (forces REST fallback)',pass:wsHealthy()===false,got:String(wsHealthy())});
-    WS.corrupt=true;
-    C.push({name:'v4.0 corrupt book is NOT reported healthy',pass:wsHealthy()===false,got:String(wsHealthy())});
-    WS.corrupt=false; WS.book.yes.clear(); WS.book.no.clear();
-  })();
-  // 23: v3.6 MAKER-FIRST
-  const mf1=decideEntry({fair:0.92,book:{yesAsk:0.80,noAsk:0.12,yesBid:0.77,noBid:0.10},tauSec:400,inHV:false,sentPressure:0,haveOpen:false,driftBps:0.02,price:66150,strike:66000,volBps:0.3,fairStreak:99});
-  C.push({name:'v3.6 maker-first rests a bid instead of crossing',pass:mf1.action==='POST_YES_BID'&&mf1.px===0.78,got:mf1.action+' @'+mf1.px});
-  const mf2=decideEntry({fair:0.92,book:{yesAsk:0.80,noAsk:0.12,yesBid:0.77,noBid:0.10},tauSec:40,inHV:false,sentPressure:0,haveOpen:false,driftBps:0.02,price:66150,strike:66000,volBps:0.3,fairStreak:99});
-  C.push({name:'v3.6 near expiry crosses as taker (no time to rest)',pass:mf2.mode==='taker',got:mf2.action+'/'+mf2.mode});
-  const mf3=decideEntry({fair:0.08,book:{yesAsk:0.92,noAsk:0.80,yesBid:0.88,noBid:0.77},tauSec:400,inHV:false,sentPressure:0,haveOpen:false,driftBps:-0.02,price:65850,strike:66000,volBps:0.3,fairStreak:99});
-  C.push({name:'v3.6 maker-first works on NO side',pass:mf3.action==='POST_NO_BID'&&mf3.px===0.78,got:mf3.action+' @'+mf3.px});
+  // 18f: v2.7 calibration transform — pulls overconfident scores toward realized win rate
+  const cal=(f)=>Math.max(0.005,Math.min(0.995,CFG.CAL_B*f+CFG.CAL_A));
+  C.push({name:'v2.7 cal: 0.90 -> ~0.86',pass:Math.abs(cal(0.90)-0.858)<0.01,got:cal(0.90).toFixed(3)});
+  C.push({name:'v2.7 cal: 0.95 -> ~0.92',pass:Math.abs(cal(0.95)-0.917)<0.01,got:cal(0.95).toFixed(3)});
+  C.push({name:'v2.7 cal is monotonic (higher raw -> higher corrected)',pass:cal(0.95)>cal(0.90)&&cal(0.90)>cal(0.85),got:'ok'});
+  C.push({name:'v2.7 cal never exceeds bounds',pass:cal(0.999)<1&&cal(0.001)>0,got:cal(0.999).toFixed(3)});
   // 18e: v2.5 tail-snipe — final-45s decided-outcome entries at the reduced bar
   const ts1=decideEntry({fair:0.99,book:{yesAsk:0.95,noAsk:0.06,yesBid:0.94,noBid:0.04},tauSec:30,inHV:false,sentPressure:0,haveOpen:false,price:66200,strike:66000,volBps:0.5,driftBps:0});
   C.push({name:'v2.5 tail-snipe fires: 11-sigma cushion, 3.7c net, tau 30',pass:ts1.action==='BUY_YES'&&/tail-snipe/.test(ts1.reason),got:ts1.action+' '+(ts1.reason||'')});
@@ -1158,24 +1219,19 @@ function runSelfTest(){
   C.push({name:'v2.5 tail with thin 0.5-sigma cushion: NO snipe',pass:ts3.action==='NONE',got:ts3.action+' '+(ts3.reason||'')});
   const ts4=decideEntry({fair:0.99,book:{yesAsk:0.95,noAsk:0.06,yesBid:0.94,noBid:0.04},tauSec:30,inHV:false,sentPressure:0,haveOpen:false,price:66200,strike:66000,volBps:0.5,driftBps:0,ticker:'A',lockout:{ticker:'A',side:'YES'}});
   C.push({name:'v2.5 tail-snipe respects reversal lockout',pass:ts4.action==='NONE',got:ts4.action+' '+(ts4.reason||'')});
+  // v3.6: tail-snipe remains EXEMPT from the saturation gate (it has its own real-cushion bar).
+  // Post-cal fair ceiling is 0.970, so winning side must be offered <= ~0.93 to clear the 3c tail bar.
+  const ts5=decideEntry({fair:0.97,rawFair:0.995,book:{yesAsk:0.93,noAsk:0.08,yesBid:0.92,noBid:0.06},tauSec:30,inHV:false,sentPressure:0,haveOpen:false,price:66200,strike:66000,volBps:0.5,driftBps:0});
+  C.push({name:'v3.6 tail-snipe still fires on pinned raw fair (real 11-sigma cushion)',pass:ts5.action==='BUY_YES'&&/tail-snipe/.test(ts5.reason),got:ts5.action+' '+(ts5.reason||'')});
   // 18d: v2.4 counter-trend stiffening — fighting a persistent trend needs the HV bar
   const ct1=decideEntry({fair:0.90,book:{yesAsk:0.82,noAsk:0.1,yesBid:0.80,noBid:0.08},tauSec:400,inHV:false,sentPressure:0,haveOpen:false,driftBps:-0.20});
-  C.push({name:'v2.4 counter-trend YES with thin edge REJECTED',pass:ct1.action==='NONE'&&/(counter-trend|drift sign gate)/.test(ct1.reason),got:ct1.action+' '+ct1.reason});
+  C.push({name:'v2.4 counter-trend YES with thin edge REJECTED',pass:ct1.action==='NONE'&&/counter-trend/.test(ct1.reason),got:ct1.action+' '+ct1.reason});
   const ct2=decideEntry({fair:0.95,book:{yesAsk:0.80,noAsk:0.1,yesBid:0.78,noBid:0.08},tauSec:400,inHV:false,sentPressure:0,haveOpen:false,driftBps:-0.20});
-  C.push({name:'v4.1 drift gate now BLOCKS counter-drift YES even with big edge (supersedes v2.4 pass-through)',pass:ct2.action==='NONE'&&/drift sign gate/.test(ct2.reason),got:ct2.action+' '+(ct2.reason||'')});
-  // v4.1 DRIFT SIGN GATE — fitted on 282 truth-anchored live trades (7/23-7/26)
-  const dg1=decideEntry({fair:0.05,book:{yesAsk:0.95,noAsk:0.70,yesBid:0.93,noBid:0.68},tauSec:400,inHV:false,sentPressure:0,haveOpen:false,driftBps:0.03,price:65850,strike:66000,volBps:0.3,fairStreak:99});
-  C.push({name:'v4.1 gate BLOCKS NO into updrift (the -$0.56/t bucket)',pass:dg1.action==='NONE'&&/drift sign gate/.test(dg1.reason),got:dg1.action+' '+(dg1.reason||'')});
-  const dg2=decideEntry({fair:0.05,book:{yesAsk:0.95,noAsk:0.70,yesBid:0.93,noBid:0.68},tauSec:400,inHV:false,sentPressure:0,haveOpen:false,driftBps:-0.03,price:65850,strike:66000,volBps:0.3,fairStreak:99});
-  C.push({name:'v4.1 gate PASSES NO with aligned downdrift',pass:/BUY_NO|POST_NO_BID/.test(dg2.action),got:dg2.action+' '+(dg2.reason||'')});
-  const dg3=decideEntry({fair:0.92,book:{yesAsk:0.80,noAsk:0.12,yesBid:0.78,noBid:0.10},tauSec:400,inHV:false,sentPressure:0,haveOpen:false,driftBps:0,price:66150,strike:66000,volBps:0.3,fairStreak:99});
-  C.push({name:'v4.1 neutral drift (0) passes — gate only fires on adverse sign',pass:/BUY_YES|POST_YES_BID/.test(dg3.action),got:dg3.action+' '+(dg3.reason||'')});
-  const dg4=decideEntry({fair:0.99,book:{yesAsk:0.95,noAsk:0.06,yesBid:0.94,noBid:0.04},tauSec:30,inHV:false,sentPressure:0,haveOpen:false,price:66200,strike:66000,volBps:0.5,driftBps:-0.05});
-  C.push({name:'v4.1 tail-snipe EXEMPT from drift gate (decided outcome)',pass:dg4.action==='BUY_YES'&&/tail-snipe/.test(dg4.reason),got:dg4.action+' '+(dg4.reason||'')});
+  C.push({name:'v3.9 F9 SUPERSEDES v2.4 big-edge exception: counter-trend hard-blocked',pass:ct2.action==='NONE'&&/opposes drift/.test(ct2.reason),got:ct2.action+' '+(ct2.reason||'')});
   const ct3=decideEntry({fair:0.90,book:{yesAsk:0.82,noAsk:0.1,yesBid:0.80,noBid:0.08},tauSec:400,inHV:false,sentPressure:0,haveOpen:false,driftBps:+0.20});
-  C.push({name:'v2.4 WITH-trend YES thin edge trades normally',pass:/BUY_YES|POST_YES_BID/.test(ct3.action),got:ct3.action+' '+(ct3.reason||'')});
+  C.push({name:'v2.4 WITH-trend YES thin edge trades normally',pass:ct3.action==='BUY_YES',got:ct3.action+' '+(ct3.reason||'')});
   const ct4=decideEntry({fair:0.90,book:{yesAsk:0.82,noAsk:0.1,yesBid:0.80,noBid:0.08},tauSec:400,inHV:false,sentPressure:0,haveOpen:false,driftBps:0.05});
-  C.push({name:'v2.4 calm tape (no trend) trades normally',pass:/BUY_YES|POST_YES_BID/.test(ct4.action),got:ct4.action+' '+(ct4.reason||'')});
+  C.push({name:'v2.4 calm tape (no trend) trades normally',pass:ct4.action==='BUY_YES',got:ct4.action+' '+(ct4.reason||'')});
   // 18c: v2.3 phantom accounting math — held-to-settlement pnl computed correctly
   (function(){
     const ph={side:'YES',px:0.64,qty:10,fees:0.16};
@@ -1189,45 +1245,32 @@ function runSelfTest(){
   })();
   // 18b: only >=0.85 favorites survive the v2.3 filter
   const f_only=decideEntry({fair:0.91,book:{yesAsk:0.80,noAsk:0.12,yesBid:0.78,noBid:0.10},tauSec:400,inHV:false,sentPressure:0,haveOpen:false});
-  C.push({name:'v2.3 filter PASSES >=0.85 favorite (only band left)',pass:/BUY_YES|POST_YES_BID/.test(f_only.action),got:f_only.action});
+  C.push({name:'v2.3 filter PASSES >=0.85 favorite (only band left)',pass:f_only.action==='BUY_YES',got:f_only.action});
   // 19: v2.2 COOLDOWN (FIXED) — a fresh-window 0.95 favorite is NOT blocked by cooldown from another window
   const f_cd=decideEntry({fair:0.95,book:{yesAsk:0.84,noAsk:0.14,yesBid:0.8,noBid:0.1},tauSec:400,inHV:false,sentPressure:0,haveOpen:false,ticker:'NEW',lockout:{ticker:'OLD',side:'NO'},cooldownUntil:Date.now()+60000});
-  C.push({name:'v2.2 cooldown does NOT block fresh-window favorite (the fix)',pass:/BUY_YES|POST_YES_BID/.test(f_cd.action),got:f_cd.action+' '+f_cd.reason});
+  C.push({name:'v2.2 cooldown does NOT block fresh-window favorite (the fix)',pass:f_cd.action==='BUY_YES',got:f_cd.action+' '+f_cd.reason});
   // 19b: same-side re-entry in the burned window IS still blocked
-  const f_cd2=decideEntry({fair:0.20,book:{yesAsk:0.9,noAsk:0.70,yesBid:0.88,noBid:0.68},tauSec:300,inHV:false,sentPressure:0,haveOpen:false,ticker:'A',lockout:{ticker:'A',side:'NO'},cooldownUntil:Date.now()+60000});
+  const f_cd2=decideEntry({fair:0.10,book:{yesAsk:0.95,noAsk:0.76,yesBid:0.93,noBid:0.74},tauSec:300,inHV:false,sentPressure:0,haveOpen:false,ticker:'A',lockout:{ticker:'A',side:'NO'},cooldownUntil:Date.now()+60000});
   C.push({name:'v2.2 same-side re-entry still blocked (whipsaw protection)',pass:f_cd2.action==='NONE'&&/(lockout|cooldown)/.test(f_cd2.reason),got:f_cd2.action+' '+f_cd2.reason});
   // 20: v2.0 NO-side filter uses (1-fair): fair 0.10 => NO conf 0.90 => passes
-  const f_no=decideEntry({fair:0.10,book:{yesAsk:0.95,noAsk:0.07,yesBid:0.9,noBid:0.05},tauSec:400,inHV:false,sentPressure:0,haveOpen:false});
-  C.push({name:'v4.5 cheap NO ask (0.07) now floor-blocked even with band pass (the coin-flip pocket)',pass:f_no.action==='NONE',got:f_no.action});
+  const f_no=decideEntry({fair:0.10,book:{yesAsk:0.95,noAsk:0.80,yesBid:0.9,noBid:0.78},tauSec:400,inHV:false,sentPressure:0,haveOpen:false});
+  C.push({name:'v2 filter PASSES NO when (1-fair)>=0.85',pass:f_no.action==='BUY_NO',got:f_no.action});
   // 21: v2.0 dollar-risk sizing math
   const q=(CFG.RISK_DOLLARS>0)?Math.round(CFG.RISK_DOLLARS/0.8):0;
   C.push({name:'dollar-risk sizing helper computes contracts (shadow default 0 = flat)',pass:(CFG.RISK_DOLLARS===0),got:'RISK_DOLLARS='+CFG.RISK_DOLLARS});
   // 16: reversal lockout — after exiting NO on reversal, same-side re-entry in that window is banned
-  const d6=decideEntry({fair:0.4,book:{yesAsk:0.8,noAsk:0.22,yesBid:0.75,noBid:0.18},tauSec:139,inHV:false,sentPressure:0,haveOpen:false,ticker:'T1',lockout:{ticker:'T1',side:'NO',ts:Date.now()}});
-  C.push({name:'reversal lockout blocks same-side re-entry',pass:d6.action==='NONE',got:d6.action+' '+d6.reason});
+  const d6=decideEntry({fair:0.10,book:{yesAsk:0.95,noAsk:0.76,yesBid:0.93,noBid:0.74},tauSec:139,inHV:false,sentPressure:0,haveOpen:false,ticker:'T1',lockout:{ticker:'T1',side:'NO',ts:Date.now()}});
+  C.push({name:'reversal lockout blocks same-side re-entry',pass:d6.action==='NONE'&&/lockout/.test(d6.reason),got:d6.action+' '+d6.reason});
   // 17: late window entry against upstream flow (+30) is vetoed at the tighter threshold
-  const d7=decideEntry({fair:0.88,book:{yesAsk:0.62,noAsk:0.30,yesBid:0.58,noBid:0.26},tauSec:139,inHV:false,sentPressure:-30,haveOpen:false,ticker:'T2',lockout:null});
-  C.push({name:'late-window flow veto at 25 (trade-3 case)',pass:d7.action==='NONE',got:d7.action+' '+d7.reason});
+  const d7=decideEntry({fair:0.88,book:{yesAsk:0.80,noAsk:0.30,yesBid:0.78,noBid:0.26},tauSec:139,inHV:false,sentPressure:-30,haveOpen:false,ticker:'T2',lockout:null});
+  C.push({name:'late-window flow veto at 25 (trade-3 case)',pass:d7.action==='NONE'&&/veto/.test(d7.reason),got:d7.action+' '+d7.reason});
   // 18: Kalshi-truth correction — tonight's mismatch (NO @0.79 scored win, actually lost)
   const tp=truthPnl({mode:'taker',entryPx:0.79,qty:10},false);
   C.push({name:'truthPnl flips phantom win to real loss',pass:Math.abs(tp-(-8.02))<0.02,got:tp});
-  // v4.4 KALSHI-TRUTH SETTLEMENT — near-strike detection + config sanity
-  C.push({name:'v4.4 KALSHI_SETTLE on by default',pass:CFG.KALSHI_SETTLE===true,got:String(CFG.KALSHI_SETTLE)});
-  C.push({name:'v4.4 settle band is a sane dollar distance',pass:CFG.KALSHI_SETTLE_BAND>0&&CFG.KALSHI_SETTLE_BAND<=50,got:'$'+CFG.KALSHI_SETTLE_BAND});
-  C.push({name:'v4.4 wait cap never strands a position (bounded seconds)',pass:CFG.KALSHI_SETTLE_WAIT>0&&CFG.KALSHI_SETTLE_WAIT<=300,got:CFG.KALSHI_SETTLE_WAIT+'s'});
-  // the -5.67 margin trade (2215, the CORRECTION) is inside the band -> would defer to Kalshi, not book a proxy guess
-  (function(){const m=-5.67;C.push({name:'v4.4 the -$5.67 correction trade IS near-strike (would defer to Kalshi)',pass:Math.abs(m)<CFG.KALSHI_SETTLE_BAND,got:'|'+m+'| < '+CFG.KALSHI_SETTLE_BAND});})();
-  // a clear trade (margin -65) is OUTSIDE the band -> settles immediately on tape (no latency added)
-  (function(){const m=-65.76;C.push({name:'v4.4 clear-of-strike trade settles immediately (no Kalshi wait)',pass:Math.abs(m)>=CFG.KALSHI_SETTLE_BAND,got:'|'+m+'| >= '+CFG.KALSHI_SETTLE_BAND});})();
-  // v4.5 PRICE FLOOR — cheap "bargains" are the model's worst-calibrated trades
-  C.push({name:'v4.5 MIN_PRICE default 0.65',pass:CFG.MIN_PRICE>=0.6&&CFG.MIN_PRICE<=0.7,got:String(CFG.MIN_PRICE)});
-  const pf1=decideEntry({fair:0.92,book:{yesAsk:0.55,noAsk:0.40,yesBid:0.50,noBid:0.35},tauSec:400,inHV:false,sentPressure:0,haveOpen:false,driftBps:0.05,price:66150,strike:66000,volBps:0.3,fairStreak:99});
-  C.push({name:'v4.5 cheap YES ask (0.55) BLOCKED despite huge apparent edge',pass:pf1.action!=='BUY_YES',got:pf1.action+' '+(pf1.reason||'')});
-  const pf2=decideEntry({fair:0.92,book:{yesAsk:0.80,noAsk:0.12,yesBid:0.78,noBid:0.10},tauSec:400,inHV:false,sentPressure:0,haveOpen:false,driftBps:0.05,price:66150,strike:66000,volBps:0.3,fairStreak:99});
-  C.push({name:'v4.5 normal-priced favorite (0.80) still trades',pass:/BUY_YES|POST_YES_BID/.test(pf2.action),got:pf2.action});
   const failed=C.filter(c=>!c.pass);
   return{ok:failed.length===0,version:VERSION,passed:C.length-failed.length,total:C.length,checks:C};
 }
+
 /* --------------------- HTTP --------------------- */
 const server=http.createServer(async(req,res)=>{
   const u=new URL(req.url,`http://${req.headers.host}`);
@@ -1239,11 +1282,6 @@ const server=http.createServer(async(req,res)=>{
     if(u.pathname==='/selftest'){const r=runSelfTest();return send(res,r.ok?200:500,r);}
     if(u.pathname==='/status')return send(res,200,STATE.lastStatus||{ok:false,error:'first tick pending'});
     if(u.pathname==='/report')return send(res,200,report());
-    if(u.pathname==='/ws')return send(res,200,{enabled:CFG.WS_ENABLED,libLoaded:!!WebSocketLib,
-      ready:WS.ready,healthy:wsHealthy(),corrupt:WS.corrupt,ticker:WS.ticker,seq:WS.seq,
-      ageMs:WS.lastMsgTs?Date.now()-WS.lastMsgTs:null,reconnects:WS.reconnects,seqGaps:WS.gaps,
-      err:WS.err,touch:wsBookTouch(),emptySnapshots:WS.emptySnapshots||0,msgTypes:WS.msgTypes,bookLevels:{yes:WS.book.yes.size,no:WS.book.no.size},
-      rawSnapshot:WS.lastSnap,rawDelta:WS.lastDelta,recentFills:WS.fills.slice(-5)});
     if(u.pathname==='/radar')return send(res,200,{url:CFG.RADAR_URL||null,fetches:RADAR.fetches,
       ageSec:RADAR.lastTs?Math.round((Date.now()-RADAR.lastTs)/1000):null,err:RADAR.err,
       parsed:radarSnapshot(),raw:RADAR.last});
@@ -1263,9 +1301,9 @@ const server=http.createServer(async(req,res)=>{
   }catch(e){return send(res,500,{ok:false,error:String(e.message||e)});}
 });
 if(require.main===module){
-  server.listen(PORT,()=>console.log(`${VERSION} SHADOW MODE on ${PORT}`));
+  server.listen(PORT,()=>console.log(`${VERSION} on ${PORT} — F1 sym-cal, F2 sat-gate, F3 px<=`+CFG.MAX_ENTRY_PX+', F4 honest risk, F5 '+CFG.SETTLE_METRIC+', F6 skip['+CFG.SKIP_SESSIONS+']'));
   const t=setInterval(()=>tick().catch(e=>{STATE.lastErr=String(e.message||e);}),2000);
   if(t.unref)t.unref();
   tick().catch(()=>{});
 }
-module.exports={computeFair,decideEntry,decideExit,takerFee,makerFee,makeCage,runSelfTest,windowState,sessionTag,tapeAvg};
+module.exports={computeFair,decideEntry,decideExit,takerFee,makerFee,makeCage,runSelfTest,windowState,sessionTag,tapeAvg,calFair,sessionSkipped,truthPnl,sizeQty};
